@@ -33,26 +33,43 @@ jobs:
             exit 1
           }
 
-      - name: Build Entware builder image
+      - name: Prepare Entware builder
         run: |
           set -eux
 
           rm -rf entware-docker
-          git clone --depth 1 https://github.com/Entware/docker.git entware-docker
+
+          git clone --depth 1 \
+            https://github.com/Entware/docker.git \
+            entware-docker
 
           cd entware-docker
 
-          # Debian 11 Bullseye reached EOL on 2026-08-31.
-          # Its security repository is no longer available from
-          # deb.debian.org, so use the Debian archive instead.
-          sed -i \
-            's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' \
-            Dockerfile
+          python3 - <<'PY'
+          from pathlib import Path
 
-          sed -i \
-            '/apt-get update/i \
-            echo "Acquire::Check-Valid-Until \\"false\\";" > /etc/apt/apt.conf.d/99no-check-valid-until && \\' \
-            Dockerfile
+          path = Path("Dockerfile")
+          text = path.read_text()
+
+          old = """RUN \\
+            apt-get update && \\
+          """
+
+          new = """RUN \\
+            find /etc/apt -type f \\
+              \\( -name '*.list' -o -name '*.sources' \\) \\
+              -exec sed -i 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' {} + && \\
+            echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until && \\
+            apt-get update && \\
+          """
+
+          if old not in text:
+              raise SystemExit(
+                  "Expected Entware Dockerfile apt section was not found"
+              )
+
+          path.write_text(text.replace(old, new, 1))
+          PY
 
           echo "Patched Entware builder Dockerfile:"
           cat Dockerfile
@@ -79,7 +96,10 @@ jobs:
               cd /home/me
 
               rm -rf Entware
-              git clone --depth 1 https://github.com/Entware/Entware.git
+
+              git clone \
+                --depth 1 \
+                https://github.com/Entware/Entware.git
 
               cd Entware
 

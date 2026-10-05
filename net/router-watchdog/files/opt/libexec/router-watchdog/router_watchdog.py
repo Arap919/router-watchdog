@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""Cron-friendly Mihomo failover watchdog for provider-backed selector groups."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_CONFIG", "/opt/etc/router-watchdog.json"))
+LOCK_PATH = Path("/opt/tmp/router-watchdog.lock")
+
+
+def log(message: str) -> None:
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}", flush=True)
+
+
+def number(cfg: dict[str, Any], key: str, low: int, high: int) -> int:
+    try:
+        value = int(cfg[key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid configuration {key}") from exc
+    if not low <= value <= high:
+        raise ValueError(f"{key}: must be between {low} and {high}")
+    return value
+
+
+class Mihomo:
+    def __init__(self, base_url: str, secret: str = "") -> None:
+        self.base = base_url.rstrip("/")
+        self.secret = secret
+        parsed = urllib.parse.urlparse(self.base)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("controller must start with http:// or https://")
+        # API requests must bypass any system proxy.
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        log(f"Mihomo controller: {self.base}")
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        data: dict[str, Any] | None = None,
+        timeout: float = 10,
+    ) -> Any:
+        headers = {"Accept": "application/json"}
+        if self.secret:
+            headers["Authorization"] = f"Bearer {self.secret}"
+        body = None if data is None else json.dumps(data, ensure_ascii=False).encode()
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+
+        request = urllib.request.Request(
+            self.base + path,
+            data=body,
+            headers=headers,
+            method=method,
+        )
+        log(f"Request: {method} {path}")
+        try:
+            with self.opener.open(request, timeout=timeout) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise RuntimeError(f"Mihomo API: HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Mihomo API is unavailable: {exc.reason}") from exc
+
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return raw.decode("utf-8", "replace")
+
+    def proxy_group(self, group: str) -> dict[str, Any]:
+        path = "/proxies/" + urllib.parse.quote(group, safe="")
+        value = self.request("GET", path)
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Unexpected response for group {group}")
+        return value
+
+    def proxy(self, node: str) -> dict[str, Any]:
+        path = "/proxies/" + urllib.parse.quote(node, safe="")
+        value = self.request("GET", path)
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Unexpected response for proxy {node}")
+        return value
+
+    def provider(self, name: str) -> dict[str, Any]:
+        path = "/providers/proxies/" + urllib.parse.quote(name, safe="")
+        value = self.request("GET", path)
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Unexpected response for proxy provider {name}")
+        return value
+
+    def update_provider(self, name: str) -> None:
+        path = "/providers/proxies/" + urllib.parse.quote(name, safe="")
+        self.request("PUT", path, timeout=30)
+
+    def select(self, group: str, node: str, timeout: float = 5) -> None:
+        path = "/proxies/" + urllib.parse.quote(group, safe="")
+        self.request("PUT", path, {"name": node}, timeout)
+
+    def provider_healthcheck(
+        self,
+        provider: str,
+        node: str,
+        url: str,
+        timeout_ms: int,
+        expected_status: int | None = None,
+    ) -> int:
+        query: dict[str, Any] = {"url": url, "timeout": timeout_ms}
+        if expected_status is not None:
+            query["expected"] = expected_status
+        path = (
+            "/providers/proxies/"
+            + urllib.parse.quote(provider, safe="")
+            + "/"
+            + urllib.parse.quote(node, safe="")
+            + "/healthcheck?"
+            + urllib.parse.urlencode(query)
+        )
+        result = self.request("GET", path, timeout=timeout_ms / 1000 + 1)
+        delay = result.get("delay") if isinstance(result, dict) else None
+        if isinstance(delay, int) and delay > 0:
+            return delay
+        raise RuntimeError(f"Healthcheck did not confirm availability: {result!r}")
+
+
+def latest_history_delay(item: dict[str, Any]) -> int | None:
+    """Use exactly the last history latency; 0 means failed check, not 0 ms."""
+    history = item.get("history")
+    if not isinstance(history, list) or not history:
+        return None
+    last = history[-1]
+    if not isinstance(last, dict):
+        return None
+    delay = last.get("delay")
+    return delay if isinstance(delay, int) and delay > 0 else None
+
+
+def provider_nodes(data: dict[str, Any], provider_name: str) -> list[dict[str, Any]]:
+    items = data.get("proxies")
+    if not isinstance(items, list):
+        return []
+
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        # Each entry in providers[].proxies is already a concrete node.
+        result.append(
+            {
+                "name": name,
+                "provider": provider_name,
+                "alive": bool(item.get("alive")),
+                "last_delay": latest_history_delay(item),
+                "raw": item,
+            }
+        )
+    return result
+
+
+def provider_test_config(data: dict[str, Any]) -> tuple[str, int | None]:
+    url = data.get("testUrl")
+    if not isinstance(url, str) or not url:
+        raise RuntimeError("Provider is missing testUrl")
+
+    expected = data.get("expectedStatus")
+    if expected is None:
+        return url, None
+    try:
+        return url, int(expected)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid provider expectedStatus: {expected!r}") from exc
+
+
+def refresh(client: Mihomo, providers: list[str]) -> None:
+    for provider in providers:
+        for attempt in range(1, 6):
+            try:
+                client.update_provider(provider)
+                log(f"Provider {provider} refreshed (attempt {attempt}/5).")
+                break
+            except Exception as exc:
+                if attempt == 5:
+                    raise RuntimeError(
+                        f"Failed to refresh provider {provider} after 5 attempts: {exc}"
+                    ) from exc
+                log(f"Failed to refresh provider {provider}: {exc}; retrying in 2 seconds ({attempt}/5).")
+                time.sleep(2)
+
+
+def current_node(client: Mihomo, group: str) -> str:
+    value = client.proxy_group(group)
+    now = value.get("now")
+    if not isinstance(now, str) or not now:
+        raise RuntimeError(f"Group {group} does not contain a current node")
+    return now
+
+
+def resolve_provider(client: Mihomo, node: str) -> str:
+    value = client.proxy(node)
+    provider = value.get("provider-name")
+    if isinstance(provider, str) and provider:
+        return provider
+    raise RuntimeError(f"Provider not found for node {node!r}")
+
+
+def providers_from_target_group(client: Mihomo, group: str) -> list[str]:
+    """Derive provider names only from concrete nodes exposed by target_group."""
+    value = client.proxy_group(group)
+    all_nodes = value.get("all")
+    if not isinstance(all_nodes, list):
+        raise RuntimeError(f"Group {group} does not contain an all list")
+
+    providers: set[str] = set()
+
+    def resolve(name: Any) -> str | None:
+        if not isinstance(name, str) or not name:
+            return None
+        try:
+            provider = client.proxy(name).get("provider-name")
+            return provider if isinstance(provider, str) and provider else None
+        except Exception as exc:
+            log(f"Failed to resolve provider for node {name!r}: {exc}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = [pool.submit(resolve, name) for name in all_nodes]
+        for future in futures:
+            provider = future.result()
+            if provider:
+                providers.add(provider)
+
+    result = sorted(providers)
+    if not result:
+        raise RuntimeError(f"Failed to determine providers from target_group {group!r}")
+
+    log(f"Providers from target_group {group}: {', '.join(result)}")
+    return result
+
+
+def check_current(
+    client: Mihomo,
+    node: str,
+    providers_data: dict[str, dict[str, Any]],
+    timeout_ms: int,
+) -> bool:
+    provider = resolve_provider(client, node)
+    data = providers_data[provider]
+    url, expected = provider_test_config(data)
+    try:
+        delay = client.provider_healthcheck(provider, node, url, timeout_ms, expected)
+        log(f"Current node {node}: healthcheck OK, {delay} ms.")
+        return True
+    except Exception as exc:
+        log(f"Current node {node}: healthcheck FAIL: {exc}")
+        return False
+
+
+def fresh_check(
+    client: Mihomo,
+    item: dict[str, Any],
+    provider_data: dict[str, Any],
+    timeout_ms: int,
+) -> tuple[str, int | None]:
+    provider = str(item["provider"])
+    name = str(item["name"])
+    url, expected = provider_test_config(provider_data)
+    try:
+        delay = client.provider_healthcheck(provider, name, url, timeout_ms, expected)
+        return name, delay
+    except Exception as exc:
+        log(f"Fresh healthcheck FAIL: {name}: {exc}")
+        return name, None
+
+
+def download(proxy: str, bytes_to_get: int, connect_timeout: int) -> int:
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    url = f"https://speed.cloudflare.com/__down?bytes={bytes_to_get}&cacheBust={time.time_ns()}"
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "router-watchdog/4.0", "Cache-Control": "no-cache"},
+    )
+    received = 0
+    with opener.open(request, timeout=connect_timeout) as response:
+        try:
+            response.fp.raw._sock.settimeout(None)
+        except (AttributeError, OSError):
+            pass
+        while chunk := response.read(128 * 1024):
+            received += len(chunk)
+    if received < bytes_to_get * 0.8:
+        raise RuntimeError(f"Speed test received only {received / 1_000_000:.1f} MB")
+    return received
+
+
+def median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def measure_speed(client: Mihomo, cfg: dict[str, Any], node: str) -> float:
+    timeout = number(cfg, "speed_connect_timeout_seconds", 1, 30)
+    group = str(cfg["target_group"])
+    client.select(group, node, timeout)
+    time.sleep(float(cfg.get("switch_wait_seconds", 0.7)))
+
+    proxy = str(cfg["benchmark_proxy"])
+    size = number(cfg, "download_bytes", 1_000_000, 200_000_000)
+    streams = number(cfg, "parallel_streams", 1, 8)
+    rounds = number(cfg, "multi_rounds", 1, 4)
+    values: list[float] = []
+
+    for _ in range(rounds):
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=streams) as pool:
+            received = sum(
+                pool.map(lambda _: download(proxy, size, timeout), range(streams))
+            )
+        elapsed = time.monotonic() - started
+        values.append(received * 8 / elapsed / 1_000_000)
+
+    return median(values)
+
+
+def collect_nodes(
+    client: Mihomo,
+    providers: list[str],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    nodes: list[dict[str, Any]] = []
+    provider_data: dict[str, dict[str, Any]] = {}
+
+    for provider in providers:
+        data = client.provider(provider)
+        provider_data[provider] = data
+        url, expected = provider_test_config(data)
+        log(f"Provider {provider}: testUrl={url}, expectedStatus={expected}")
+        nodes.extend(provider_nodes(data, provider))
+
+    # A node name should be unique inside the group. If a subscription ever
+    # produces duplicates, keep the first occurrence.
+    unique: dict[str, dict[str, Any]] = {}
+    for item in nodes:
+        unique.setdefault(str(item["name"]), item)
+    return list(unique.values()), provider_data
+
+
+def choose_and_apply(cfg: dict[str, Any]) -> None:
+    client = Mihomo(str(cfg["controller"]), str(cfg.get("secret", "")))
+    group = str(cfg["target_group"])
+    health_timeout = number(cfg, "healthcheck_timeout_ms", 250, 10000)
+    workers = number(cfg, "healthcheck_parallelism", 1, 32)
+
+    node = current_node(client, group)
+    log(f"Current node in group {group}: {node}")
+
+    # The current node is ALWAYS checked with a fresh provider healthcheck.
+    # Do not use alive/history here: they may be stale because provider healthcheck
+    # runs every 5 minutes and lazy providers may not check unused nodes.
+    # No /proxies/<node>/delay: provider-owned nodes are checked through
+    # /providers/proxies/{provider}/{node}/healthcheck.
+    current_provider = resolve_provider(client, node)
+    current_provider_data = client.provider(current_provider)
+    current_provider_data_map = {current_provider: current_provider_data}
+    if check_current(client, node, current_provider_data_map, health_timeout):
+        log("Current node is healthy. No switch is required.")
+        return
+
+    log("Current node failed the fresh healthcheck; starting candidate selection.")
+    providers = providers_from_target_group(client, group)
+    refresh(client, providers)
+    nodes, provider_data = collect_nodes(client, providers)
+
+    # Initial ranking: ONLY the last history latency, exactly as requested.
+    historical = [
+        item for item in nodes
+        if item["alive"] and item["last_delay"] is not None
+    ]
+    historical.sort(key=lambda item: int(item["last_delay"]))
+    top_n = number(cfg, "top_n", 1, 50)
+    shortlist = historical[:top_n]
+
+    log(
+        "Top {} by latest history.delay: {}".format(
+            top_n,
+            ", ".join(
+                f'{item["name"]} ({item["last_delay"]} ms)'
+                for item in shortlist
+            ) or "no candidates",
+        )
+    )
+
+    if not shortlist:
+        raise RuntimeError("No nodes with a positive latest history.delay")
+
+    # Fresh-check the shortlist. If 3+ of these fail, assume the cached
+    # provider health state is unreliable and check every concrete proxy.
+    def check(item: dict[str, Any]) -> tuple[str, int | None]:
+        return fresh_check(client, item, provider_data[str(item["provider"])], health_timeout)
+
+    checked: list[tuple[dict[str, Any], int]] = []
+    failed = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(check, item): item for item in shortlist}
+        for future in as_completed(futures):
+            item = futures[future]
+            name, delay = future.result()
+            if delay is None:
+                failed += 1
+            else:
+                checked.append((item, delay))
+
+    log(f"Fresh healthcheck for top-{len(shortlist)}: OK={len(checked)}, FAIL={failed}.")
+
+    if failed >= 3:
+        log("3 or more candidates failed the fresh healthcheck; running a full fresh healthcheck for all proxies.")
+        checked = []
+        failed_all = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(check, item): item for item in nodes}
+            for future in as_completed(futures):
+                item = futures[future]
+                _, delay = future.result()
+                if delay is None:
+                    failed_all += 1
+                else:
+                    checked.append((item, delay))
+        log(f"Full fresh healthcheck: OK={len(checked)}, FAIL={failed_all}, total={len(nodes)}.")
+
+    if not checked:
+        raise RuntimeError("No available nodes remain after the fresh healthcheck")
+
+    checked.sort(key=lambda value: value[1])
+    fresh_top_n = number(cfg, "fresh_top_n", 1, 30)
+    finalists = checked[:fresh_top_n]
+    log(
+        "Speed-test candidates: "
+        + ", ".join(f"{item['name']} ({delay} ms)" for item, delay in finalists)
+    )
+
+    tested: list[tuple[str, int, float]] = []
+    for item, delay in finalists:
+        name = str(item["name"])
+        try:
+            speed = measure_speed(client, cfg, name)
+            tested.append((name, delay, speed))
+            log(f"Speed {name}: {speed:.2f} Mbps, healthcheck {delay} ms")
+        except Exception as exc:
+            log(f"Speed-test failed for {name}: {exc}")
+
+    if not tested:
+        raise RuntimeError("Failed to measure speed for any finalist")
+
+    # Highest speed wins. If speeds are close, lower fresh latency wins.
+    tested.sort(key=lambda value: value[2], reverse=True)
+    tolerance = number(cfg, "close_result_percent", 0, 50) / 100
+    best_speed = tested[0][2]
+    close = [value for value in tested if value[2] >= best_speed * (1 - tolerance)]
+    winner = min(close, key=lambda value: value[1])
+
+    client.select(group, winner[0])
+    log(
+        f"Selected winner: {winner[0]} — "
+        f"{winner[2]:.2f} Mbps, {winner[1]} ms."
+    )
+
+
+def main() -> int:
+    if not CONFIG_PATH.exists():
+        print(f"Configuration file not found: {CONFIG_PATH}", file=sys.stderr)
+        return 2
+
+    try:
+        lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        log("Previous run is still in progress; skipping.")
+        return 0
+
+    try:
+        with CONFIG_PATH.open(encoding="utf-8") as handle:
+            cfg = json.load(handle)
+        if not isinstance(cfg, dict):
+            raise ValueError("Configuration must be a JSON object")
+
+        choose_and_apply(cfg)
+        return 0
+    except Exception as exc:
+        log(f"Error: {exc}")
+        return 1
+    finally:
+        os.close(lock_fd)
+        try:
+            LOCK_PATH.unlink()
+        except FileNotFoundError:
+            pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

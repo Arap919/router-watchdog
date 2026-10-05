@@ -1,0 +1,16 @@
+{
+  "controller": "http://127.0.0.1:9090",
+  "secret": "",
+  "target_group": "",
+  "benchmark_proxy": "http://127.0.0.1:7890",
+  "top_n": 7,
+  "fresh_top_n": 7,
+  "healthcheck_parallelism": 6,
+  "healthcheck_timeout_ms": 5000,
+  "speed_connect_timeout_seconds": 5,
+  "switch_wait_seconds": 0.7,
+  "download_bytes": 25000000,
+  "parallel_streams": 4,
+  "multi_rounds": 2,
+  "close_result_percent": 10
+}

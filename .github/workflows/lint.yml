@@ -1,0 +1,53 @@
+name: Check package sources
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check Python syntax
+        run: python3 -m py_compile net/router-watchdog/files/opt/libexec/router-watchdog/router_watchdog.py
+
+      - name: Check for Cyrillic in source and documentation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          files = [
+              Path('README.md'),
+              Path('net/router-watchdog/files/opt/libexec/router-watchdog/router_watchdog.py'),
+          ]
+          for path in files:
+              text = path.read_text(encoding='utf-8')
+              if any('\u0400' <= ch <= '\u04ff' for ch in text):
+                  raise SystemExit(f'Cyrillic characters found in {path}')
+          PY
+
+      - name: Check configuration keys
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          config = json.loads(Path('net/router-watchdog/files/opt/etc/router-watchdog.json').read_text())
+          expected = {
+              'controller', 'secret', 'target_group', 'benchmark_proxy',
+              'top_n', 'fresh_top_n', 'healthcheck_parallelism',
+              'healthcheck_timeout_ms', 'speed_connect_timeout_seconds',
+              'switch_wait_seconds', 'download_bytes', 'parallel_streams',
+              'multi_rounds', 'close_result_percent',
+          }
+          actual = set(config)
+          if actual != expected:
+              raise SystemExit(f'Unexpected config keys: {sorted(actual ^ expected)}')
+          PY

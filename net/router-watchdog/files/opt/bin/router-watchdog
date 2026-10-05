@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /opt/bin/python3 /opt/libexec/router-watchdog/router_watchdog.py "$@"

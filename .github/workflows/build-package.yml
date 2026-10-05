@@ -1,0 +1,147 @@
+name: Build Entware package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Verify release tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          package_version=$(sed -n 's/^PKG_VERSION:=//p' net/router-watchdog/Makefile)
+          tag_version=${GITHUB_REF_NAME#v}
+          test "$package_version" = "$tag_version" || {
+            echo "Package version $package_version does not match tag $GITHUB_REF_NAME" >&2
+            exit 1
+          }
+
+      - name: Build Entware builder image
+        run: |
+          docker build --pull --tag entware-builder \
+            https://github.com/Entware/docker.git#main
+
+      - name: Build .ipk
+        run: |
+          mkdir -p dist
+          docker run --rm --user root \
+            -e GITHUB_WORKSPACE=/workspace \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            entware-builder \
+            bash -euxo pipefail -c '
+              cd /home/me
+              git clone --depth 1 https://github.com/Entware/Entware.git
+              cd Entware
+
+              cp /workspace/configs/x64-3.2.config .config
+              make package/symlinks
+
+              printf "src-link router-watchdog /workspace/net\n" >> feeds.conf
+              ./scripts/feeds update router-watchdog
+              ./scripts/feeds install -a -p router-watchdog
+
+              echo "CONFIG_PACKAGE_router-watchdog=m" >> .config
+              make package/router-watchdog/compile V=s
+
+              mkdir -p /workspace/dist
+              package=$(find bin -type f -name "router-watchdog_*.ipk" | head -n 1)
+              test -n "$package"
+              cp "$package" /workspace/dist/
+            '
+
+      - name: Verify package
+        run: |
+          set -eux
+          ls -lh dist/*.ipk
+          ar t dist/*.ipk
+          test "$(find dist -maxdepth 1 -name '*.ipk' | wc -l)" -eq 1
+
+      - name: Build feed
+        run: |
+          set -eux
+          rm -rf feed
+          mkdir -p feed/all
+          cp dist/*.ipk feed/all/
+
+          package=$(find feed/all -maxdepth 1 -name '*.ipk' -print -quit)
+          filename=$(basename "$package")
+          sha256=$(sha256sum "$package" | awk '{print $1}')
+          size=$(stat -c '%s' "$package")
+
+          control=$(mktemp)
+          ar p "$package" control.tar.gz | tar -xOzf - ./control > "$control"
+          cat "$control" > feed/all/Packages
+          printf 'Filename: all/%s\n' "$filename" >> feed/all/Packages
+          printf 'Size: %s\n' "$size" >> feed/all/Packages
+          printf 'SHA256sum: %s\n\n' "$sha256" >> feed/all/Packages
+          rm -f "$control"
+
+          gzip -9 -c feed/all/Packages > feed/all/Packages.gz
+          cp README.md feed/README.md
+
+      - name: Verify feed metadata
+        run: |
+          set -eux
+          gzip -t feed/all/Packages.gz
+          grep -E '^Package: router-watchdog$' feed/all/Packages
+          grep -E '^Architecture: all$' feed/all/Packages
+          grep -E '^Filename: all/router-watchdog_' feed/all/Packages
+          grep -E '^SHA256sum: [0-9a-f]{64}$' feed/all/Packages
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: router-watchdog-ipk
+          path: dist/*.ipk
+          if-no-files-found: error
+
+      - name: Upload feed artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: router-watchdog-feed
+          path: feed/
+          if-no-files-found: error
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.ipk
+
+  publish-feed:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download feed artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: router-watchdog-feed
+          path: feed
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: feed
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

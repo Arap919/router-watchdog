@@ -51,24 +51,22 @@ jobs:
           path = Path("Dockerfile")
           text = path.read_text()
 
-          old = """RUN \\
-            apt-get update && \\
-          """
+          needle = "apt-get update && \\"
 
-          new = """RUN \\
-            find /etc/apt -type f \\
-              \\( -name '*.list' -o -name '*.sources' \\) \\
-              -exec sed -i 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' {} + && \\
-            echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until && \\
-            apt-get update && \\
-          """
+          replacement = """find /etc/apt -type f \\
+            \\( -name '*.list' -o -name '*.sources' \\) \\
+            -exec sed -i 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' {} + && \\
+          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until && \\
+          apt-get update && \\"""
 
-          if old not in text:
+          if needle not in text:
               raise SystemExit(
-                  "Expected Entware Dockerfile apt section was not found"
+                  "Could not find 'apt-get update && \\\\' in Entware Dockerfile"
               )
 
-          path.write_text(text.replace(old, new, 1))
+          text = text.replace(needle, replacement, 1)
+
+          path.write_text(text)
           PY
 
           echo "Patched Entware builder Dockerfile:"

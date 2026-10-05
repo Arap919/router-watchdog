@@ -12,6 +12,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -20,8 +24,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -eu
+
           package_version=$(sed -n 's/^PKG_VERSION:=//p' net/router-watchdog/Makefile)
           tag_version=${GITHUB_REF_NAME#v}
+
           test "$package_version" = "$tag_version" || {
             echo "Package version $package_version does not match tag $GITHUB_REF_NAME" >&2
             exit 1
@@ -29,75 +35,150 @@ jobs:
 
       - name: Build Entware builder image
         run: |
-          docker build --pull --tag entware-builder \
-            https://github.com/Entware/docker.git#main
+          set -eux
+
+          rm -rf entware-docker
+          git clone --depth 1 https://github.com/Entware/docker.git entware-docker
+
+          cd entware-docker
+
+          # Debian 11 Bullseye reached EOL on 2026-08-31.
+          # Its security repository is no longer available from
+          # deb.debian.org, so use the Debian archive instead.
+          sed -i \
+            's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' \
+            Dockerfile
+
+          sed -i \
+            '/apt-get update/i \
+            echo "Acquire::Check-Valid-Until \\"false\\";" > /etc/apt/apt.conf.d/99no-check-valid-until && \\' \
+            Dockerfile
+
+          echo "Patched Entware builder Dockerfile:"
+          cat Dockerfile
+
+          cd ..
+
+          docker build \
+            --pull \
+            --tag entware-builder \
+            ./entware-docker
 
       - name: Build .ipk
         run: |
+          set -eux
+
           mkdir -p dist
-          docker run --rm --user root \
+
+          docker run --rm \
+            --user root \
             -e GITHUB_WORKSPACE=/workspace \
             -v "$GITHUB_WORKSPACE:/workspace" \
             entware-builder \
             bash -euxo pipefail -c '
               cd /home/me
+
+              rm -rf Entware
               git clone --depth 1 https://github.com/Entware/Entware.git
+
               cd Entware
 
               cp /workspace/configs/x64-3.2.config .config
+
               make package/symlinks
 
               printf "src-link router-watchdog /workspace/net\n" >> feeds.conf
+
               ./scripts/feeds update router-watchdog
               ./scripts/feeds install -a -p router-watchdog
 
               echo "CONFIG_PACKAGE_router-watchdog=m" >> .config
+
               make package/router-watchdog/compile V=s
 
               mkdir -p /workspace/dist
-              package=$(find bin -type f -name "router-watchdog_*.ipk" | head -n 1)
+
+              package=$(find bin \
+                -type f \
+                -name "router-watchdog_*.ipk" \
+                -print \
+                -quit)
+
               test -n "$package"
+
               cp "$package" /workspace/dist/
             '
 
       - name: Verify package
         run: |
           set -eux
+
           ls -lh dist/*.ipk
+
           ar t dist/*.ipk
+
           test "$(find dist -maxdepth 1 -name '*.ipk' | wc -l)" -eq 1
 
       - name: Build feed
         run: |
           set -eux
+
           rm -rf feed
           mkdir -p feed/all
+
           cp dist/*.ipk feed/all/
 
-          package=$(find feed/all -maxdepth 1 -name '*.ipk' -print -quit)
+          package=$(find feed/all \
+            -maxdepth 1 \
+            -name '*.ipk' \
+            -print \
+            -quit)
+
           filename=$(basename "$package")
           sha256=$(sha256sum "$package" | awk '{print $1}')
           size=$(stat -c '%s' "$package")
 
           control=$(mktemp)
-          ar p "$package" control.tar.gz | tar -xOzf - ./control > "$control"
+
+          ar p "$package" control.tar.gz \
+            | tar -xOzf - ./control \
+            > "$control"
+
           cat "$control" > feed/all/Packages
-          printf 'Filename: all/%s\n' "$filename" >> feed/all/Packages
-          printf 'Size: %s\n' "$size" >> feed/all/Packages
-          printf 'SHA256sum: %s\n\n' "$sha256" >> feed/all/Packages
+
+          printf 'Filename: all/%s\n' "$filename" \
+            >> feed/all/Packages
+
+          printf 'Size: %s\n' "$size" \
+            >> feed/all/Packages
+
+          printf 'SHA256sum: %s\n\n' "$sha256" \
+            >> feed/all/Packages
+
           rm -f "$control"
 
-          gzip -9 -c feed/all/Packages > feed/all/Packages.gz
+          gzip -9 -c feed/all/Packages \
+            > feed/all/Packages.gz
+
           cp README.md feed/README.md
 
       - name: Verify feed metadata
         run: |
           set -eux
+
           gzip -t feed/all/Packages.gz
-          grep -E '^Package: router-watchdog$' feed/all/Packages
-          grep -E '^Architecture: all$' feed/all/Packages
-          grep -E '^Filename: all/router-watchdog_' feed/all/Packages
-          grep -E '^SHA256sum: [0-9a-f]{64}$' feed/all/Packages
+
+          grep -E '^Package: router-watchdog$' \
+            feed/all/Packages
+
+          grep -E '^Architecture: all$' \
+            feed/all/Packages
+
+          grep -E '^Filename: all/router-watchdog_' \
+            feed/all/Packages
+
+          grep -E '^SHA256sum: [0-9a-f]{64}$' \
+            feed/all/Packages
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v6
@@ -121,15 +202,21 @@ jobs:
 
   publish-feed:
     if: startsWith(github.ref, 'refs/tags/v')
+
     needs: build
+
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
+      actions: read
       pages: write
       id-token: write
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
       - name: Download feed artifact
         uses: actions/download-artifact@v7

@@ -101,7 +101,7 @@ jobs:
 
               cd Entware
 
-              cp /workspace/configs/x64-3.2.config .config
+              cp configs/x64-3.2.config .config
 
               make package/symlinks
 

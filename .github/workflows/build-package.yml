@@ -116,7 +116,9 @@ jobs:
           echo "=== Add local router-watchdog feed ==="
 
           printf '%s\n' \
-            'src-link router-watchdog /workspace/net' \
+
+            'src-link router_watchdog /workspace/net' \
+
             >> feeds.conf
 
           echo "=== feeds.conf ==="
@@ -125,7 +127,7 @@ jobs:
 
           echo "=== Update router-watchdog feed ==="
 
-          ./scripts/feeds update router-watchdog
+          ./scripts/feeds update router_watchdog
 
           echo "=== Install router-watchdog package definition ==="
 
@@ -133,9 +135,9 @@ jobs:
 
           echo "=== Verify package symlink ==="
 
-          test -L package/feeds/router-watchdog/router-watchdog
+          test -L package/feeds/router_watchdog/router-watchdog
 
-          ls -la package/feeds/router-watchdog/router-watchdog
+          ls -la package/feeds/router_watchdog/router-watchdog
 
           echo "=== Enable router-watchdog ==="
 

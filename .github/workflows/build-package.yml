@@ -105,8 +105,12 @@ jobs:
 
               make package/symlinks
 
-              printf "src-link router-watchdog /workspace/net\n" >> feeds.conf
+              printf '\nsrc-link router-watchdog /workspace/net\n' >> feeds.conf
 
+              echo "=== feeds.conf ==="
+              nl -ba feeds.conf
+
+              ./scripts/feeds list -n
               ./scripts/feeds update router-watchdog
               ./scripts/feeds install -a -p router-watchdog
 

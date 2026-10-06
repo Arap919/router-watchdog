@@ -2,8 +2,10 @@ name: Build Entware package
 
 on:
   push:
-    branches: [main]
-    tags: ['v*.*.*']
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
   pull_request:
 
 permissions:
@@ -27,6 +29,9 @@ jobs:
 
           package_version=$(sed -n 's/^PKG_VERSION:=//p' net/router-watchdog/Makefile)
           tag_version=${GITHUB_REF_NAME#v}
+
+          echo "Package version: $package_version"
+          echo "Release tag:      $tag_version"
 
           test "$package_version" = "$tag_version" || {
             echo "Package version $package_version does not match tag $GITHUB_REF_NAME" >&2
@@ -61,15 +66,13 @@ jobs:
 
           if needle not in text:
               raise SystemExit(
-                  "Could not find 'apt-get update && \\\\' in Entware Dockerfile"
+                  "Expected Entware Dockerfile apt section was not found"
               )
 
-          text = text.replace(needle, replacement, 1)
-
-          path.write_text(text)
+          path.write_text(text.replace(needle, replacement, 1))
           PY
 
-          echo "Patched Entware builder Dockerfile:"
+          echo "=== Patched Dockerfile ==="
           cat Dockerfile
 
           cd ..
@@ -90,56 +93,119 @@ jobs:
             -e GITHUB_WORKSPACE=/workspace \
             -v "$GITHUB_WORKSPACE:/workspace" \
             entware-builder \
-            bash -euxo pipefail -c '
-              cd /home/me
+            bash -euxo pipefail <<'SCRIPT'
 
-              rm -rf Entware
+          cd /home/me
 
-              git clone \
-                --depth 1 \
-                https://github.com/Entware/Entware.git
+          rm -rf Entware
 
-              cd Entware
+          git clone --depth 1 \
+            https://github.com/Entware/Entware.git \
+            Entware
 
-              cp configs/x64-3.2.config .config
+          cd Entware
 
-              make package/symlinks
+          echo "=== Entware revision ==="
+          git rev-parse HEAD
 
-              printf '\nsrc-link router-watchdog /workspace/net\n' >> feeds.conf
+          echo "=== Configure target ==="
 
-              echo "=== feeds.conf ==="
-              nl -ba feeds.conf
+          cp configs/x64-3.2.config .config
 
-              ./scripts/feeds list -n
-              ./scripts/feeds update router-watchdog
-              ./scripts/feeds install -a -p router-watchdog
+          echo "=== Add local router-watchdog feed ==="
 
-              echo "CONFIG_PACKAGE_router-watchdog=m" >> .config
+          printf '%s\n' \
+            'src-link router-watchdog /workspace/net' \
+            >> feeds.conf
 
-              make package/router-watchdog/compile V=s
+          echo "=== feeds.conf ==="
+          nl -ba feeds.conf
 
-              mkdir -p /workspace/dist
+          echo "=== Update router-watchdog feed ==="
 
-              package=$(find bin \
-                -type f \
-                -name "router-watchdog_*.ipk" \
-                -print \
-                -quit)
+          ./scripts/feeds update router-watchdog
 
-              test -n "$package"
+          echo "=== Install router-watchdog package definition ==="
 
-              cp "$package" /workspace/dist/
-            '
+          ./scripts/feeds install router-watchdog
+
+          echo "=== Verify package symlink ==="
+
+          test -L package/feeds/router-watchdog/router-watchdog
+
+          ls -la package/feeds/router-watchdog/router-watchdog
+
+          echo "=== Enable router-watchdog ==="
+
+          echo "CONFIG_PACKAGE_router-watchdog=m" >> .config
+
+          echo "=== Run defconfig ==="
+
+          make defconfig
+
+          echo "=== Verify package configuration ==="
+
+          grep '^CONFIG_PACKAGE_router-watchdog=' .config
+
+          echo "=== Build router-watchdog ==="
+
+          make package/router-watchdog/compile V=s
+
+          echo "=== Find generated package ==="
+
+          package=$(find bin \
+            -type f \
+            -name 'router-watchdog_*.ipk' \
+            -print \
+            -quit)
+
+          echo "Selected package: [$package]"
+
+          test -n "$package"
+
+          echo "=== Copy package to workspace ==="
+
+          mkdir -p /workspace/dist
+
+          cp "$package" /workspace/dist/
+
+          echo "=== Generated package ==="
+
+          ls -lh /workspace/dist/
+
+          SCRIPT
 
       - name: Verify package
         run: |
           set -eux
 
-          ls -lh dist/*.ipk
+          echo "=== Package files ==="
+          ls -lh dist/
 
-          ar t dist/*.ipk
+          package_count=$(find dist \
+            -maxdepth 1 \
+            -type f \
+            -name '*.ipk' \
+            | wc -l)
 
-          test "$(find dist -maxdepth 1 -name '*.ipk' | wc -l)" -eq 1
+          test "$package_count" -eq 1
+
+          package=$(find dist \
+            -maxdepth 1 \
+            -type f \
+            -name '*.ipk' \
+            -print \
+            -quit)
+
+          echo "Package: $package"
+
+          echo "=== IPK archive ==="
+          ar t "$package"
+
+          echo "=== Package control metadata ==="
+
+          ar p "$package" control.tar.gz \
+            | tar -xOzf - ./control
 
       - name: Build feed
         run: |
@@ -152,12 +218,15 @@ jobs:
 
           package=$(find feed/all \
             -maxdepth 1 \
+            -type f \
             -name '*.ipk' \
             -print \
             -quit)
 
           filename=$(basename "$package")
+
           sha256=$(sha256sum "$package" | awk '{print $1}')
+
           size=$(stat -c '%s' "$package")
 
           control=$(mktemp)
@@ -168,21 +237,36 @@ jobs:
 
           cat "$control" > feed/all/Packages
 
-          printf 'Filename: all/%s\n' "$filename" \
+          printf 'Filename: all/%s\n' \
+            "$filename" \
             >> feed/all/Packages
 
-          printf 'Size: %s\n' "$size" \
+          printf 'Size: %s\n' \
+            "$size" \
             >> feed/all/Packages
 
-          printf 'SHA256sum: %s\n\n' "$sha256" \
+          printf 'SHA256sum: %s\n\n' \
+            "$sha256" \
             >> feed/all/Packages
 
           rm -f "$control"
 
-          gzip -9 -c feed/all/Packages \
+          gzip -9 -c \
+            feed/all/Packages \
             > feed/all/Packages.gz
 
           cp README.md feed/README.md
+
+          echo "=== Feed contents ==="
+
+          find feed \
+            -maxdepth 2 \
+            -type f \
+            -print
+
+          echo "=== Packages ==="
+
+          cat feed/all/Packages
 
       - name: Verify feed metadata
         run: |
@@ -197,6 +281,9 @@ jobs:
             feed/all/Packages
 
           grep -E '^Filename: all/router-watchdog_' \
+            feed/all/Packages
+
+          grep -E '^Size: [0-9]+$' \
             feed/all/Packages
 
           grep -E '^SHA256sum: [0-9a-f]{64}$' \
@@ -222,16 +309,15 @@ jobs:
         with:
           files: dist/*.ipk
 
+
   publish-feed:
     if: startsWith(github.ref, 'refs/tags/v')
-
     needs: build
 
     runs-on: ubuntu-latest
 
     permissions:
       contents: read
-      actions: read
       pages: write
       id-token: write
 

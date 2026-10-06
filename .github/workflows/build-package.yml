@@ -82,22 +82,22 @@ jobs:
             --tag entware-builder \
             ./entware-docker
 
-      - name: Build .ipk
+      - name: Create Entware build script
         run: |
           set -eux
 
-          mkdir -p dist
+          cat > build-entware.sh <<'SCRIPT'
+          #!/bin/bash
 
-          docker run --rm \
-            --user root \
-            -e GITHUB_WORKSPACE=/workspace \
-            -v "$GITHUB_WORKSPACE:/workspace" \
-            entware-builder \
-            bash -euxo pipefail <<'SCRIPT'
+          set -euxo pipefail
+
+          echo "=== Start Entware build ==="
 
           cd /home/me
 
           rm -rf Entware
+
+          echo "=== Clone Entware ==="
 
           git clone --depth 1 \
             https://github.com/Entware/Entware.git \
@@ -106,6 +106,7 @@ jobs:
           cd Entware
 
           echo "=== Entware revision ==="
+
           git rev-parse HEAD
 
           echo "=== Configure target ==="
@@ -119,6 +120,7 @@ jobs:
             >> feeds.conf
 
           echo "=== feeds.conf ==="
+
           nl -ba feeds.conf
 
           echo "=== Update router-watchdog feed ==="
@@ -173,13 +175,33 @@ jobs:
 
           ls -lh /workspace/dist/
 
+          echo "=== Entware build completed successfully ==="
           SCRIPT
+
+          chmod +x build-entware.sh
+
+          echo "=== Build script ==="
+          cat build-entware.sh
+
+      - name: Build .ipk
+        run: |
+          set -eux
+
+          mkdir -p dist
+
+          docker run --rm \
+            --user root \
+            -e GITHUB_WORKSPACE=/workspace \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            entware-builder \
+            bash -euxo pipefail /workspace/build-entware.sh
 
       - name: Verify package
         run: |
           set -eux
 
           echo "=== Package files ==="
+
           ls -lh dist/
 
           package_count=$(find dist \
@@ -200,6 +222,7 @@ jobs:
           echo "Package: $package"
 
           echo "=== IPK archive ==="
+
           ar t "$package"
 
           echo "=== Package control metadata ==="
@@ -212,6 +235,7 @@ jobs:
           set -eux
 
           rm -rf feed
+
           mkdir -p feed/all
 
           cp dist/*.ipk feed/all/
@@ -308,7 +332,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.ipk
-
 
   publish-feed:
     if: startsWith(github.ref, 'refs/tags/v')

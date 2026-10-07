@@ -129,6 +129,14 @@ jobs:
 
           ./scripts/feeds install -p router_watchdog router-watchdog
 
+          echo "=== Update packages feed ==="
+
+          ./scripts/feeds update packages
+
+          echo "=== Install python3 package definition ==="
+
+          ./scripts/feeds install python3
+
           echo "=== Verify package symlink ==="
 
           test -L package/feeds/router_watchdog/router-watchdog
@@ -148,6 +156,14 @@ jobs:
           grep '^CONFIG_PACKAGE_router-watchdog=' .config
 
           echo "=== Build router-watchdog ==="
+
+          echo "=== Build Entware host tools ==="
+
+          make -j"$(nproc)" tools/install
+
+          echo "=== Build Entware toolchain ==="
+
+          make -j"$(nproc)" toolchain/install
 
           make package/router-watchdog/compile V=s
 

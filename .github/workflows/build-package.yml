@@ -82,6 +82,18 @@ jobs:
             --tag entware-builder \
             ./entware-docker
 
+      - name: Restore Entware build cache
+        id: entware-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            entware-cache/build_dir
+            entware-cache/staging_dir
+            entware-cache/dl
+          key: ${{ runner.os }}-entware-x64-3.2-${{ hashFiles('net/router-watchdog/Makefile', 'net/router-watchdog/files/**') }}
+          restore-keys: |
+            ${{ runner.os }}-entware-x64-3.2-
+
       - name: Create Entware build script
         run: |
           set -eux
@@ -104,6 +116,20 @@ jobs:
             Entware
 
           cd Entware
+
+          echo "=== Attach Entware build cache ==="
+
+          mkdir -p /workspace/entware-cache
+
+          for cache_dir in build_dir staging_dir dl; do
+            mkdir -p "/workspace/entware-cache/$cache_dir"
+
+            if [ -e "$cache_dir" ] || [ -L "$cache_dir" ]; then
+              rmdir "$cache_dir"
+            fi
+
+            ln -s "/workspace/entware-cache/$cache_dir" "$cache_dir"
+          done
 
           echo "=== Entware revision ==="
 
@@ -219,6 +245,16 @@ jobs:
             -v "$GITHUB_WORKSPACE:/workspace" \
             entware-builder \
             bash -euxo pipefail /workspace/build-entware.sh
+
+      - name: Save Entware build cache
+        if: always() && steps.entware-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            entware-cache/build_dir
+            entware-cache/staging_dir
+            entware-cache/dl
+          key: ${{ runner.os }}-entware-x64-3.2-${{ hashFiles('net/router-watchdog/Makefile', 'net/router-watchdog/files/**') }}
 
       - name: Verify package
         run: |

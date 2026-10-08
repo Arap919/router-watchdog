@@ -28,6 +28,10 @@ define Package/router-watchdog/conffiles
 /opt/etc/router-watchdog.json
 endef
 
+define Build/Compile
+	true
+endef
+
 define Package/router-watchdog/install
 	$(INSTALL_DIR) $(1)/opt/bin
 	$(INSTALL_DIR) $(1)/opt/libexec/router-watchdog

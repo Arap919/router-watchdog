@@ -82,17 +82,29 @@ jobs:
             --tag entware-builder \
             ./entware-docker
 
+      - name: Resolve Entware feed revisions
+        id: entware-revisions
+        run: |
+          set -euo pipefail
+
+          entware=$(git ls-remote https://github.com/Entware/Entware.git HEAD | cut -f1)
+          packages=$(git ls-remote https://github.com/Entware/entware-packages.git HEAD | cut -f1)
+          rustlang=$(git ls-remote https://github.com/Entware/entware-rust.git HEAD | cut -f1)
+
+          test -n "$entware"
+          test -n "$packages"
+          test -n "$rustlang"
+
+          echo "entware=$entware" >> "$GITHUB_OUTPUT"
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          echo "rustlang=$rustlang" >> "$GITHUB_OUTPUT"
+
       - name: Restore Entware build cache
         id: entware-cache
         uses: actions/cache/restore@v4
         with:
-          path: |
-            entware-cache/build_dir
-            entware-cache/staging_dir
-            entware-cache/dl
-          key: ${{ runner.os }}-entware-x64-3.2-${{ hashFiles('net/router-watchdog/Makefile', 'net/router-watchdog/files/**') }}
-          restore-keys: |
-            ${{ runner.os }}-entware-x64-3.2-
+          path: entware-cache.tar
+          key: ${{ runner.os }}-entware-x64-3.2-${{ steps.entware-revisions.outputs.entware }}-${{ steps.entware-revisions.outputs.packages }}-${{ steps.entware-revisions.outputs.rustlang }}-${{ hashFiles('net/router-watchdog/Makefile', 'net/router-watchdog/files/**') }}
 
       - name: Create Entware build script
         run: |
@@ -117,19 +129,29 @@ jobs:
 
           cd Entware
 
-          echo "=== Attach Entware build cache ==="
+          save_build_cache() {
+            build_status=$?
+            trap - EXIT
 
-          mkdir -p /workspace/entware-cache
+            echo "=== Save Entware build cache archive ==="
 
-          for cache_dir in build_dir staging_dir dl; do
-            mkdir -p "/workspace/entware-cache/$cache_dir"
-
-            if [ -e "$cache_dir" ] || [ -L "$cache_dir" ]; then
-              rmdir "$cache_dir"
+            if tar -cf /workspace/entware-cache.tar \
+              build_dir staging_dir dl; then
+              chmod 644 /workspace/entware-cache.tar
+            else
+              echo "Failed to create Entware build cache archive" >&2
+              exit 1
             fi
 
-            ln -s "/workspace/entware-cache/$cache_dir" "$cache_dir"
-          done
+            exit "$build_status"
+          }
+
+          trap save_build_cache EXIT
+
+          if [ -f /workspace/entware-cache.tar ]; then
+            echo "=== Restore Entware build cache archive ==="
+            tar -xf /workspace/entware-cache.tar
+          fi
 
           echo "=== Entware revision ==="
 
@@ -250,11 +272,8 @@ jobs:
         if: always() && steps.entware-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: |
-            entware-cache/build_dir
-            entware-cache/staging_dir
-            entware-cache/dl
-          key: ${{ runner.os }}-entware-x64-3.2-${{ hashFiles('net/router-watchdog/Makefile', 'net/router-watchdog/files/**') }}
+          path: entware-cache.tar
+          key: ${{ runner.os }}-entware-x64-3.2-${{ steps.entware-revisions.outputs.entware }}-${{ steps.entware-revisions.outputs.packages }}-${{ steps.entware-revisions.outputs.rustlang }}-${{ hashFiles('net/router-watchdog/Makefile', 'net/router-watchdog/files/**') }}
 
       - name: Verify package
         run: |
@@ -283,11 +302,11 @@ jobs:
 
           echo "=== IPK archive ==="
 
-          ar t "$package"
+          tar -tzf "$package"
 
           echo "=== Package control metadata ==="
 
-          ar p "$package" control.tar.gz \
+          tar -xOzf "$package" ./control.tar.gz \
             | tar -xOzf - ./control
 
       - name: Build feed
@@ -315,7 +334,7 @@ jobs:
 
           control=$(mktemp)
 
-          ar p "$package" control.tar.gz \
+          tar -xOzf "$package" ./control.tar.gz \
             | tar -xOzf - ./control \
             > "$control"
 

@@ -133,6 +133,10 @@ jobs:
 
           ./scripts/feeds update packages
 
+          echo "=== Update rustlang feed ==="
+
+          ./scripts/feeds update rustlang
+
           echo "=== Install python3 package definition ==="
 
           ./scripts/feeds install python3

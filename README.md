@@ -25,14 +25,17 @@ the same package is also attached to the corresponding GitHub Release.
 Create a release with:
 
 ```sh
-git tag v1.0.0
-git push origin v1.0.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
-The resulting package can be installed manually with:
+The resulting package is attached to the GitHub Release. For example, release
+`v1.0.2` provides:
 
 ```sh
-opkg install router-watchdog_1.0.0-1_all.ipk
+wget -O /tmp/router-watchdog_1.0.2-1_all.ipk \
+  https://github.com/Arap919/router-watchdog/releases/download/v1.0.2/router-watchdog_1.0.2-1_all.ipk
+opkg install /tmp/router-watchdog_1.0.2-1_all.ipk
 ```
 
 The package itself contains only Python and shell files, so it is architecture
@@ -53,16 +56,11 @@ shown by the GitHub Pages deployment. For a repository named
 https://OWNER.github.io/router-watchdog/all
 ```
 
-Then install or upgrade the package with:
+Add the feed on the router as described in [Installation](#installation). The
+feed index stores the package filename relative to this `/all` directory; the
+correct package URL has one `all` path component, not `/all/all/`.
 
-```sh
-printf '%s\n' 'src/gz router-watchdog https://OWNER.github.io/router-watchdog/all' \
-  >> /opt/etc/opkg.conf
-opkg update
-opkg install router-watchdog
-```
-
-For a newer tagged release:
+To upgrade an installed package:
 
 ```sh
 opkg update
@@ -78,24 +76,6 @@ that the tag version matches `PKG_VERSION` in the package Makefile. Pull request
 and normal `main` pushes still build and validate the package, but do not change
 the public feed.
 
-## Package layout
-
-```text
-net/router-watchdog/
-├── Makefile
-├── test.sh
-└── files/
-    └── opt/
-        ├── bin/router-watchdog
-        ├── etc/
-        │   ├── cron.1min/router-watchdog
-        │   └── router-watchdog.json
-        └── libexec/router-watchdog/router_watchdog.py
-```
-
-`router-watchdog.json` is declared as an Entware/OpenWrt conffile, so an
-existing user-modified configuration is preserved during package upgrades.
-
 ## Requirements
 
 - Entware with Python 3 available as `/opt/bin/python3`.
@@ -108,12 +88,84 @@ code only.
 
 ## Installation
 
-After the package is published in an Entware-compatible feed:
+### Other Entware architectures
+
+On Entware architectures where the configured `opkg` downloader already
+supports HTTPS, add the feed and install the package:
 
 ```sh
+FEED='src/gz router-watchdog https://arap919.github.io/router-watchdog/all'
+grep -qF "$FEED" /opt/etc/opkg.conf || echo "$FEED" >> /opt/etc/opkg.conf
+
 opkg update
 opkg install router-watchdog
 ```
+
+If `opkg update` reports `wget: not an http or ftp url: https://...`, follow
+the [MIPSel HTTPS downloader instructions](#keenetic-with-mipsel-entware) to
+install Entware's `wget-ssl`, then retry `opkg update`.
+
+### Keenetic with MIPSel Entware
+
+The package is architecture-independent (`Architecture: all`), but its
+dependencies must still be available for the router's Entware architecture.
+For example, Keenetic systems using the `mipselsf-k3.4` feed resolve Python 3,
+CA certificates, and the HTTPS downloader from that architecture's Entware
+feeds.
+
+The default Entware `wget` on this MIPSel setup may not support HTTPS. If
+`opkg update` reports:
+
+```text
+wget: not an http or ftp url: https://...
+```
+
+first update the Entware feeds and install its HTTPS-capable downloader. The
+Entware repository URL uses HTTP, so this step does not require HTTPS support:
+
+```sh
+opkg update
+opkg install wget-ssl
+```
+
+If the router-watchdog feed was already configured, this first `opkg update`
+may still report the HTTPS download error for that feed. The Entware HTTP
+indexes are updated independently, so continue with `opkg install wget-ssl`.
+
+Then add the router-watchdog feed and install the package:
+
+```sh
+FEED='src/gz router-watchdog https://arap919.github.io/router-watchdog/all'
+grep -qF "$FEED" /opt/etc/opkg.conf || echo "$FEED" >> /opt/etc/opkg.conf
+
+opkg update
+opkg install router-watchdog
+```
+
+If `opkg` tries to fetch a URL containing
+`/router-watchdog/all/all/router-watchdog_...ipk`, refresh the package index:
+an earlier feed index had an extra `all/` prefix in `Filename`. The published
+index has been corrected; after `opkg update`, the package URL should contain
+only one `/all/`.
+
+The watchdog package is architecture-independent, while `wget-ssl`, Python 3,
+and other runtime dependencies are installed as matching MIPSel packages by
+Entware.
+
+### After installation
+
+These steps apply to all supported Entware architectures. Edit the
+configuration and apply its cron schedule:
+
+```sh
+vi /opt/etc/router-watchdog.json
+/opt/bin/router-watchdog --sync-cron
+```
+
+Set at least `target_group` to the name of a Mihomo selector group. The full
+configuration example and schedule options are documented below. Ensure
+Entware's `crond` is running and reads `/opt/etc/crontabs/root`; otherwise the
+scheduled watchdog runs will not execute.
 
 The package installs:
 
@@ -127,8 +179,8 @@ The package installs:
 The package also updates its managed entries in `/opt/etc/crontabs/root`.
 Entware `crond` must be running with that crontab directory.
 
-The configuration file is registered as a package conffile, so package upgrades
-do not silently replace a modified `/opt/etc/router-watchdog.json`.
+The configuration file is registered as a package conffile, so package
+upgrades do not silently replace a modified `/opt/etc/router-watchdog.json`.
 
 ## Manual run
 

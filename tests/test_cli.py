@@ -124,21 +124,77 @@ class TestCronSchedule(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = pathlib.Path(directory) / "config.json"
             crontab_path = pathlib.Path(directory) / "crontabs" / "root"
+            legacy_crontab_path = pathlib.Path(directory) / "etc-crontabs" / "root"
             log_path = pathlib.Path(directory) / "watchdog.log"
             config_path.write_text('{"controller": "http://localhost:9090"}', encoding="utf-8")
+            legacy_crontab_path.parent.mkdir()
+            legacy_crontab_path.write_text(
+                f'MAILTO=""\n{module.CRON_BEGIN}\n'
+                "* * * * * /opt/bin/router-watchdog\n"
+                f"{module.CRON_END}\n0 4 * * * /opt/bin/backup\n",
+                encoding="utf-8",
+            )
 
             with (
                 mock.patch.object(module, "CONFIG_PATH", config_path),
+                mock.patch.object(module, "DEFAULT_CRONTAB_PATH", crontab_path),
+                mock.patch.object(module, "LEGACY_CRONTAB_PATH", legacy_crontab_path),
                 mock.patch.object(module, "CRONTAB_PATH", crontab_path),
+                mock.patch.object(module, "CRON_INIT_SCRIPT", pathlib.Path("/mock/S10cron")),
+                mock.patch.object(module.subprocess, "run") as restart_cron,
                 mock.patch.object(module, "LOG_PATH", log_path),
                 mock.patch.object(sys, "argv", ["router-watchdog", "--sync-cron"]),
             ):
+                self.assertEqual(module.main(), 0)
                 self.assertEqual(module.main(), 0)
 
             self.assertIn(
                 "0,30 1-6 * * * /opt/bin/router-watchdog",
                 crontab_path.read_text(encoding="utf-8"),
             )
+            restart_cron.assert_called_once_with(
+                ["/mock/S10cron", "restart"], check=True
+            )
+            legacy_crontab = legacy_crontab_path.read_text(encoding="utf-8")
+            self.assertNotIn(module.CRON_BEGIN, legacy_crontab)
+            self.assertIn('MAILTO=""', legacy_crontab)
+            self.assertIn("0 4 * * * /opt/bin/backup", legacy_crontab)
+
+    def test_remove_cron_command_cleans_active_and_legacy_crontabs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            active_crontab = pathlib.Path(directory) / "spool" / "root"
+            legacy_crontab = pathlib.Path(directory) / "etc" / "root"
+            log_path = pathlib.Path(directory) / "watchdog.log"
+            managed_block = (
+                f"{module.CRON_BEGIN}\n"
+                "* * * * * /opt/bin/router-watchdog\n"
+                f"{module.CRON_END}\n"
+            )
+            for path in (active_crontab, legacy_crontab):
+                path.parent.mkdir()
+                path.write_text(
+                    "0 4 * * * /opt/bin/backup\n" + managed_block,
+                    encoding="utf-8",
+                )
+
+            with (
+                mock.patch.object(module, "DEFAULT_CRONTAB_PATH", active_crontab),
+                mock.patch.object(module, "LEGACY_CRONTAB_PATH", legacy_crontab),
+                mock.patch.object(module, "CRONTAB_PATH", active_crontab),
+                mock.patch.object(module, "CRON_INIT_SCRIPT", pathlib.Path("/mock/S10cron")),
+                mock.patch.object(module.subprocess, "run") as restart_cron,
+                mock.patch.object(module, "LOG_PATH", log_path),
+                mock.patch.object(sys, "argv", ["router-watchdog", "--remove-cron"]),
+            ):
+                self.assertEqual(module.main(), 0)
+
+            restart_cron.assert_called_once_with(
+                ["/mock/S10cron", "restart"], check=True
+            )
+            for path in (active_crontab, legacy_crontab):
+                content = path.read_text(encoding="utf-8")
+                self.assertNotIn(module.CRON_BEGIN, content)
+                self.assertIn("0 4 * * * /opt/bin/backup", content)
 
     def test_log_appends_timestamped_messages_to_file(self):
         with tempfile.TemporaryDirectory() as directory:

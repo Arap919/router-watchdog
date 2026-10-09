@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -22,9 +23,10 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_CONFIG", "/opt/etc/router-watchdog.json"))
 LOCK_PATH = Path("/opt/tmp/router-watchdog.lock")
 LOG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_LOG", "/opt/var/log/router-watchdog.log"))
-CRONTAB_PATH = Path(
-    os.environ.get("ROUTER_WATCHDOG_CRONTAB", "/opt/etc/crontabs/root")
-)
+DEFAULT_CRONTAB_PATH = Path("/opt/var/spool/cron/crontabs/root")
+LEGACY_CRONTAB_PATH = Path("/opt/etc/crontabs/root")
+CRONTAB_PATH = Path(os.environ.get("ROUTER_WATCHDOG_CRONTAB", DEFAULT_CRONTAB_PATH))
+CRON_INIT_SCRIPT = Path("/opt/etc/init.d/S10cron")
 CRON_BEGIN = "# BEGIN router-watchdog managed entries"
 CRON_END = "# END router-watchdog managed entries"
 DEFAULT_SCHEDULE = {
@@ -201,6 +203,10 @@ def update_managed_crontab(path: Path, entries: list[str]) -> bool:
         if temporary_path and os.path.exists(temporary_path):
             os.unlink(temporary_path)
     return True
+
+
+def restart_cron() -> None:
+    subprocess.run([str(CRON_INIT_SCRIPT), "restart"], check=True)
 
 
 class Mihomo:
@@ -686,7 +692,14 @@ def main() -> int:
 
     if args.remove_cron:
         try:
-            changed = update_managed_crontab(CRONTAB_PATH, [])
+            active_changed = update_managed_crontab(CRONTAB_PATH, [])
+            changed = active_changed
+            if CRONTAB_PATH == DEFAULT_CRONTAB_PATH:
+                changed = (
+                    update_managed_crontab(LEGACY_CRONTAB_PATH, []) or changed
+                )
+            if active_changed:
+                restart_cron()
             log(
                 "Removed router-watchdog cron entries."
                 if changed
@@ -709,7 +722,14 @@ def main() -> int:
 
         if args.sync_cron:
             entries = cron_entries(cfg.get("schedule", DEFAULT_SCHEDULE))
-            changed = update_managed_crontab(CRONTAB_PATH, entries)
+            active_changed = update_managed_crontab(CRONTAB_PATH, entries)
+            changed = active_changed
+            if CRONTAB_PATH == DEFAULT_CRONTAB_PATH:
+                changed = (
+                    update_managed_crontab(LEGACY_CRONTAB_PATH, []) or changed
+                )
+            if active_changed:
+                restart_cron()
             if changed:
                 log(
                     "Updated router-watchdog cron schedule."

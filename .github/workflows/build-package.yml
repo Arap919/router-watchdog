@@ -7,12 +7,20 @@ on:
     tags:
       - 'v*.*.*'
   pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release whose IPK should be republished in the feed
+        required: true
+        default: v1.0.2
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     permissions:
@@ -342,7 +350,7 @@ jobs:
 
           cat "$control" > feed/all/Packages
 
-          printf 'Filename: all/%s\n' \
+          printf 'Filename: %s\n' \
             "$filename" \
             >> feed/all/Packages
 
@@ -385,7 +393,7 @@ jobs:
           grep -E '^Architecture: all$' \
             feed/all/Packages
 
-          grep -E '^Filename: all/router-watchdog_' \
+          grep -E '^Filename: router-watchdog_' \
             feed/all/Packages
 
           grep -E '^Size: [0-9]+$' \
@@ -435,6 +443,82 @@ jobs:
         with:
           name: router-watchdog-feed
           path: feed
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: feed
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+
+  republish-feed:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download existing release package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          mkdir -p dist
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'router-watchdog_*.ipk' \
+            --dir dist
+
+          test "$(find dist -maxdepth 1 -type f -name 'router-watchdog_*.ipk' | wc -l)" -eq 1
+
+      - name: Build corrected feed
+        run: |
+          set -euo pipefail
+
+          package=$(find dist -maxdepth 1 -type f -name 'router-watchdog_*.ipk' -print -quit)
+          filename=$(basename "$package")
+          sha256=$(sha256sum "$package" | awk '{print $1}')
+          size=$(stat -c '%s' "$package")
+          control=$(mktemp)
+
+          mkdir -p feed/all
+
+          tar -xOzf "$package" ./control.tar.gz \
+            | tar -xOzf - ./control \
+            > "$control"
+
+          cat "$control" > feed/all/Packages
+          printf 'Filename: %s\nSize: %s\nSHA256sum: %s\n\n' \
+            "$filename" "$size" "$sha256" \
+            >> feed/all/Packages
+          rm -f "$control"
+
+          gzip -9 -c feed/all/Packages > feed/all/Packages.gz
+          cp README.md feed/README.md
+
+          grep -E '^Package: router-watchdog$' feed/all/Packages
+          grep -E '^Filename: router-watchdog_' feed/all/Packages
+          gzip -t feed/all/Packages.gz
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v4

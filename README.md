@@ -167,6 +167,14 @@ configuration example and schedule options are documented below. Ensure
 Entware's `crond` is running and reads `/opt/etc/crontabs/root`; otherwise the
 scheduled watchdog runs will not execute.
 
+Execution logs are appended to `/opt/var/log/router-watchdog.log`. The managed
+crontab also truncates this file every Sunday at 06:59 router-local time. To
+inspect the log:
+
+```sh
+tail -f /opt/var/log/router-watchdog.log
+```
+
 The package installs:
 
 ```text
@@ -546,7 +554,9 @@ The hook is:
 It is expected that Entware already runs `run-parts` for this directory every
 minute. Package installation creates the initial crontab entries, and later
 configuration edits are synchronized by the hook. Removing the package removes
-only its marked entries from the root crontab.
+only its marked entries from the root crontab. A separate managed cron entry
+clears `/opt/var/log/router-watchdog.log` every Sunday at 06:59 router-local
+time.
 
 ## License
 

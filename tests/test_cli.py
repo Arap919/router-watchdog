@@ -51,6 +51,7 @@ class TestCronSchedule(unittest.TestCase):
             [
                 "* 0,7-23 * * * /opt/bin/router-watchdog",
                 "0,30 1-6 * * * /opt/bin/router-watchdog",
+                "59 6 * * 0 /opt/bin/router-watchdog --clear-log",
             ],
         )
 
@@ -68,11 +69,15 @@ class TestCronSchedule(unittest.TestCase):
             [
                 "0,5 0 * * * /opt/bin/router-watchdog",
                 "55 23 * * * /opt/bin/router-watchdog",
+                "59 6 * * 0 /opt/bin/router-watchdog --clear-log",
             ],
         )
 
     def test_empty_windows_disable_schedule(self):
-        self.assertEqual(module.cron_entries({"windows": []}), [])
+        self.assertEqual(
+            module.cron_entries({"windows": []}),
+            ["59 6 * * 0 /opt/bin/router-watchdog --clear-log"],
+        )
 
     def test_matching_start_and_end_mean_all_day(self):
         self.assertEqual(
@@ -83,7 +88,10 @@ class TestCronSchedule(unittest.TestCase):
                     ]
                 }
             ),
-            ["* * * * * /opt/bin/router-watchdog"],
+            [
+                "* * * * * /opt/bin/router-watchdog",
+                "59 6 * * 0 /opt/bin/router-watchdog --clear-log",
+            ],
         )
 
     def test_rejects_ambiguous_or_invalid_windows(self):
@@ -116,11 +124,13 @@ class TestCronSchedule(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = pathlib.Path(directory) / "config.json"
             crontab_path = pathlib.Path(directory) / "crontabs" / "root"
+            log_path = pathlib.Path(directory) / "watchdog.log"
             config_path.write_text('{"controller": "http://localhost:9090"}', encoding="utf-8")
 
             with (
                 mock.patch.object(module, "CONFIG_PATH", config_path),
                 mock.patch.object(module, "CRONTAB_PATH", crontab_path),
+                mock.patch.object(module, "LOG_PATH", log_path),
                 mock.patch.object(sys, "argv", ["router-watchdog", "--sync-cron"]),
             ):
                 self.assertEqual(module.main(), 0)
@@ -129,6 +139,36 @@ class TestCronSchedule(unittest.TestCase):
                 "0,30 1-6 * * * /opt/bin/router-watchdog",
                 crontab_path.read_text(encoding="utf-8"),
             )
+
+    def test_log_appends_timestamped_messages_to_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = pathlib.Path(directory) / "logs" / "watchdog.log"
+            stdout = io.StringIO()
+
+            with mock.patch.object(module, "LOG_PATH", log_path):
+                with redirect_stdout(stdout):
+                    module.log("test message")
+
+            self.assertIn("test message", stdout.getvalue())
+            self.assertIn("test message", log_path.read_text(encoding="utf-8"))
+            self.assertRegex(log_path.read_text(encoding="utf-8"), r"^\d{4}-\d{2}-\d{2}")
+
+    def test_weekly_clear_command_truncates_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = pathlib.Path(directory) / "logs" / "watchdog.log"
+            log_path.parent.mkdir()
+            log_path.write_text("old log entry\n", encoding="utf-8")
+            stdout = io.StringIO()
+
+            with (
+                mock.patch.object(module, "LOG_PATH", log_path),
+                mock.patch.object(sys, "argv", ["router-watchdog", "--clear-log"]),
+                redirect_stdout(stdout),
+            ):
+                self.assertEqual(module.main(), 0)
+
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "")
+            self.assertIn("Cleared log file", stdout.getvalue())
 
 
 if __name__ == "__main__":

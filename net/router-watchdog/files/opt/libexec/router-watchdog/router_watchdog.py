@@ -21,6 +21,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_CONFIG", "/opt/etc/router-watchdog.json"))
 LOCK_PATH = Path("/opt/tmp/router-watchdog.lock")
+LOG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_LOG", "/opt/var/log/router-watchdog.log"))
 CRONTAB_PATH = Path(
     os.environ.get("ROUTER_WATCHDOG_CRONTAB", "/opt/etc/crontabs/root")
 )
@@ -35,7 +36,24 @@ DEFAULT_SCHEDULE = {
 
 
 def log(message: str) -> None:
-    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}", flush=True)
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+    print(line, flush=True)
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError as exc:
+        print(f"Failed to write log file {LOG_PATH}: {exc}", file=sys.stderr)
+
+
+def clear_log() -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LOG_PATH.write_text("", encoding="utf-8")
+    except OSError as exc:
+        print(f"Failed to clear log file {LOG_PATH}: {exc}", file=sys.stderr)
+        raise
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} Cleared log file {LOG_PATH}.")
 
 
 def number(cfg: dict[str, Any], key: str, low: int, high: int) -> int:
@@ -116,11 +134,13 @@ def cron_entries(schedule: Any) -> list[str]:
     for hour, minutes in minutes_by_hour.items():
         hours_by_minutes.setdefault(tuple(sorted(minutes)), set()).add(hour)
 
-    return [
+    entries = [
         f"{cron_field(set(minutes), 59)} "
         f"{cron_field(hours, 23)} * * * /opt/bin/router-watchdog"
         for minutes, hours in sorted(hours_by_minutes.items())
     ]
+    entries.append("59 6 * * 0 /opt/bin/router-watchdog --clear-log")
+    return entries
 
 
 def update_managed_crontab(path: Path, entries: list[str]) -> bool:
@@ -647,10 +667,22 @@ def main() -> int:
         action="store_true",
         help="remove this package's entries from the Entware root crontab",
     )
+    action.add_argument(
+        "--clear-log",
+        action="store_true",
+        help="truncate the watchdog log file",
+    )
     if any(value in {"-h", "--help"} for value in sys.argv[1:]):
         parser.print_help()
         return 0
     args = parser.parse_args()
+
+    if args.clear_log:
+        try:
+            clear_log()
+            return 0
+        except OSError:
+            return 1
 
     if args.remove_cron:
         try:
@@ -666,7 +698,7 @@ def main() -> int:
             return 1
 
     if not CONFIG_PATH.exists():
-        print(f"Configuration file not found: {CONFIG_PATH}", file=sys.stderr)
+        log(f"Configuration file not found: {CONFIG_PATH}")
         return 2
 
     try:

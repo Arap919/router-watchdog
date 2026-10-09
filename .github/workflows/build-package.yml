@@ -507,6 +507,7 @@ jobs:
             | tar -xOzf - ./control \
             > "$control"
 
+          cp "$package" feed/all/
           cat "$control" > feed/all/Packages
           printf 'Filename: %s\nSize: %s\nSHA256sum: %s\n\n' \
             "$filename" "$size" "$sha256" \

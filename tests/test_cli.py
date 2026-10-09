@@ -196,6 +196,39 @@ class TestCronSchedule(unittest.TestCase):
                 self.assertNotIn(module.CRON_BEGIN, content)
                 self.assertIn("0 4 * * * /opt/bin/backup", content)
 
+    def test_sync_cron_reports_service_restart_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = pathlib.Path(directory) / "config.json"
+            crontab_path = pathlib.Path(directory) / "spool" / "root"
+            log_path = pathlib.Path(directory) / "watchdog.log"
+            stdout = io.StringIO()
+            config_path.write_text(
+                '{"controller": "http://localhost:9090"}', encoding="utf-8"
+            )
+
+            with (
+                mock.patch.object(module, "CONFIG_PATH", config_path),
+                mock.patch.object(module, "DEFAULT_CRONTAB_PATH", crontab_path),
+                mock.patch.object(module, "CRONTAB_PATH", crontab_path),
+                mock.patch.object(
+                    module, "CRON_INIT_SCRIPT", pathlib.Path("/mock/S10cron")
+                ),
+                mock.patch.object(
+                    module.subprocess,
+                    "run",
+                    side_effect=module.subprocess.CalledProcessError(
+                        1, ["/mock/S10cron", "restart"]
+                    ),
+                ),
+                mock.patch.object(module, "LOG_PATH", log_path),
+                mock.patch.object(sys, "argv", ["router-watchdog", "--sync-cron"]),
+                redirect_stdout(stdout),
+            ):
+                self.assertEqual(module.main(), 1)
+
+            self.assertIn("Error:", stdout.getvalue())
+            self.assertIn("restart", stdout.getvalue())
+
     def test_log_appends_timestamped_messages_to_file(self):
         with tempfile.TemporaryDirectory() as directory:
             log_path = pathlib.Path(directory) / "logs" / "watchdog.log"

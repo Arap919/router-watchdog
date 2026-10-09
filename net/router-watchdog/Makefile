@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=router-watchdog
-PKG_VERSION:=1.0.1
+PKG_VERSION:=1.0.2
 PKG_RELEASE:=1
 PKG_MAINTAINER:=Arap919
 PKG_LICENSE:=MIT
@@ -26,6 +26,19 @@ endef
 
 define Package/router-watchdog/conffiles
 /opt/etc/router-watchdog.json
+endef
+
+define Package/router-watchdog/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+/opt/bin/router-watchdog --sync-cron
+endef
+
+define Package/router-watchdog/prerm
+#!/bin/sh
+[ "$$1" = "upgrade" ] && exit 0
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+/opt/bin/router-watchdog --remove-cron
 endef
 
 define Build/Compile

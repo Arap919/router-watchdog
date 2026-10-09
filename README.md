@@ -124,6 +124,9 @@ The package installs:
 /opt/etc/cron.1min/router-watchdog
 ```
 
+The package also updates its managed entries in `/opt/etc/crontabs/root`.
+Entware `crond` must be running with that crontab directory.
+
 The configuration file is registered as a package conffile, so package upgrades
 do not silently replace a modified `/opt/etc/router-watchdog.json`.
 
@@ -171,8 +174,54 @@ Example:
   "download_bytes": 25000000,
   "parallel_streams": 4,
   "multi_rounds": 2,
-  "close_result_percent": 10
+  "close_result_percent": 10,
+  "schedule": {
+    "windows": [
+      {
+        "start": "07:00",
+        "end": "01:00",
+        "every_minutes": 1
+      },
+      {
+        "start": "01:00",
+        "end": "07:00",
+        "every_minutes": 30
+      }
+    ]
+  }
 }
+```
+
+### `schedule`
+
+**Type:** object
+**Required:** no; defaults to the package's current schedule for existing configs
+
+`schedule.windows` contains daily time windows. Each window has `start` and
+`end` in the router's local time (`HH:MM`) and an `every_minutes` interval from
+1 to 1440. The start is included and the end is excluded; windows may cross
+midnight. Matching start and end times mean a full-day window. Overlapping
+windows are combined. An empty `windows` array disables scheduled runs.
+
+For example, to run every five minutes from 07:00 until 01:00 and every
+30 minutes overnight:
+
+```json
+"schedule": {
+  "windows": [
+    { "start": "07:00", "end": "01:00", "every_minutes": 5 },
+    { "start": "01:00", "end": "07:00", "every_minutes": 30 }
+  ]
+}
+```
+
+The package writes only its marked block in `/opt/etc/crontabs/root`; other
+crontab entries are left unchanged. The package's `cron.1min` hook synchronizes
+the managed entries after a configuration edit, normally within one minute.
+To apply the schedule immediately after editing the JSON, run:
+
+```sh
+/opt/bin/router-watchdog --sync-cron
 ```
 
 ### `controller`
@@ -430,20 +479,22 @@ currently selected node is healthy.
 
 ## Cron
 
-The package integrates with the existing Entware/Keenetic `cron.1min` setup.
-The installed wrapper is:
+The package keeps using the existing Entware/Keenetic `cron.1min` hook, but it
+now uses that hook only to synchronize the configured schedule. The actual
+watchdog runs are native entries in `/opt/etc/crontabs/root`, generated from
+`schedule.windows`. Entware `crond` must be enabled and configured to read
+`/opt/etc/crontabs`.
+
+The hook is:
 
 ```text
 /opt/etc/cron.1min/router-watchdog
 ```
 
 It is expected that Entware already runs `run-parts` for this directory every
-minute. The wrapper then applies the watchdog schedule:
-
-- `07:00–00:59` — every minute
-- `01:00–06:59` — at minute `00` and `30`
-
-This avoids depending on a separate cron implementation.
+minute. Package installation creates the initial crontab entries, and later
+configuration edits are synchronized by the hook. Removing the package removes
+only its marked entries from the root crontab.
 
 ## License
 

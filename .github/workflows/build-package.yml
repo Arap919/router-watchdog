@@ -105,6 +105,8 @@ jobs:
         with:
           path: entware-cache.tar
           key: ${{ runner.os }}-entware-x64-3.2-${{ steps.entware-revisions.outputs.entware }}-${{ steps.entware-revisions.outputs.packages }}-${{ steps.entware-revisions.outputs.rustlang }}-${{ hashFiles('net/router-watchdog/Makefile', 'net/router-watchdog/files/**') }}
+          restore-keys: |
+            ${{ runner.os }}-entware-x64-3.2-${{ steps.entware-revisions.outputs.entware }}-${{ steps.entware-revisions.outputs.packages }}-${{ steps.entware-revisions.outputs.rustlang }}-
 
       - name: Create Entware build script
         run: |
@@ -269,7 +271,7 @@ jobs:
             bash -euxo pipefail /workspace/build-entware.sh
 
       - name: Save Entware build cache
-        if: always() && steps.entware-cache.outputs.cache-hit != 'true'
+        if: always() && steps.entware-cache.outputs.cache-matched-key == ''
         uses: actions/cache/save@v4
         with:
           path: entware-cache.tar

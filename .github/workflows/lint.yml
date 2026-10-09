@@ -18,6 +18,9 @@ jobs:
       - name: Check Python syntax
         run: python3 -m py_compile net/router-watchdog/files/opt/libexec/router-watchdog/router_watchdog.py
 
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+
       - name: Check for Cyrillic in source and documentation
         run: |
           python3 - <<'PY'
@@ -45,7 +48,7 @@ jobs:
               'top_n', 'fresh_top_n', 'healthcheck_parallelism',
               'healthcheck_timeout_ms', 'speed_connect_timeout_seconds',
               'switch_wait_seconds', 'download_bytes', 'parallel_streams',
-              'multi_rounds', 'close_result_percent',
+              'multi_rounds', 'close_result_percent', 'schedule',
           }
           actual = set(config)
           if actual != expected:

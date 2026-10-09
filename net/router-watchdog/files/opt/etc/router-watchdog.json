@@ -12,5 +12,19 @@
   "download_bytes": 25000000,
   "parallel_streams": 4,
   "multi_rounds": 2,
-  "close_result_percent": 10
+  "close_result_percent": 10,
+  "schedule": {
+    "windows": [
+      {
+        "start": "07:00",
+        "end": "01:00",
+        "every_minutes": 1
+      },
+      {
+        "start": "01:00",
+        "end": "07:00",
+        "every_minutes": 30
+      }
+    ]
+  }
 }

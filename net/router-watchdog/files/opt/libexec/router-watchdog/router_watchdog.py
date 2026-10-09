@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -18,6 +21,17 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_CONFIG", "/opt/etc/router-watchdog.json"))
 LOCK_PATH = Path("/opt/tmp/router-watchdog.lock")
+CRONTAB_PATH = Path(
+    os.environ.get("ROUTER_WATCHDOG_CRONTAB", "/opt/etc/crontabs/root")
+)
+CRON_BEGIN = "# BEGIN router-watchdog managed entries"
+CRON_END = "# END router-watchdog managed entries"
+DEFAULT_SCHEDULE = {
+    "windows": [
+        {"start": "07:00", "end": "01:00", "every_minutes": 1},
+        {"start": "01:00", "end": "07:00", "every_minutes": 30},
+    ]
+}
 
 
 def log(message: str) -> None:
@@ -32,6 +46,141 @@ def number(cfg: dict[str, Any], key: str, low: int, high: int) -> int:
     if not low <= value <= high:
         raise ValueError(f"{key}: must be between {low} and {high}")
     return value
+
+
+def minute_of_day(value: Any, field: str) -> int:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value
+    ):
+        raise ValueError(f"schedule window {field} must use HH:MM (00:00-23:59)")
+    hour, minute = (int(part) for part in value.split(":"))
+    return hour * 60 + minute
+
+
+def cron_field(values: set[int], maximum: int) -> str:
+    if len(values) == maximum + 1:
+        return "*"
+
+    ordered = sorted(values)
+    ranges: list[str] = []
+    start = previous = ordered[0]
+    for value in ordered[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = value
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def cron_entries(schedule: Any) -> list[str]:
+    if not isinstance(schedule, dict) or set(schedule) != {"windows"}:
+        raise ValueError("schedule must contain only a windows array")
+    windows = schedule["windows"]
+    if not isinstance(windows, list):
+        raise ValueError("schedule.windows must be an array")
+
+    scheduled_minutes: set[int] = set()
+    for index, window in enumerate(windows):
+        if not isinstance(window, dict) or set(window) != {
+            "start",
+            "end",
+            "every_minutes",
+        }:
+            raise ValueError(
+                f"schedule.windows[{index}] must contain start, end, and every_minutes"
+            )
+        start = minute_of_day(window["start"], f"windows[{index}].start")
+        end = minute_of_day(window["end"], f"windows[{index}].end")
+        interval = window["every_minutes"]
+        if isinstance(interval, bool) or not isinstance(interval, int):
+            raise ValueError(
+                f"schedule.windows[{index}].every_minutes must be an integer"
+            )
+        if not 1 <= interval <= 1440:
+            raise ValueError(
+                f"schedule.windows[{index}].every_minutes must be between 1 and 1440"
+            )
+        duration = (end - start) % 1440 or 1440
+        scheduled_minutes.update(
+            (start + offset) % 1440 for offset in range(0, duration, interval)
+        )
+
+    minutes_by_hour: dict[int, set[int]] = {}
+    for value in scheduled_minutes:
+        hour, minute = divmod(value, 60)
+        minutes_by_hour.setdefault(hour, set()).add(minute)
+
+    hours_by_minutes: dict[tuple[int, ...], set[int]] = {}
+    for hour, minutes in minutes_by_hour.items():
+        hours_by_minutes.setdefault(tuple(sorted(minutes)), set()).add(hour)
+
+    return [
+        f"{cron_field(set(minutes), 59)} "
+        f"{cron_field(hours, 23)} * * * /opt/bin/router-watchdog"
+        for minutes, hours in sorted(hours_by_minutes.items())
+    ]
+
+
+def update_managed_crontab(path: Path, entries: list[str]) -> bool:
+    if path.is_symlink():
+        raise ValueError(f"Refusing to modify symlinked crontab: {path}")
+    if not path.exists() and not entries:
+        return False
+
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = existing.splitlines(keepends=True)
+    begin_indexes = [
+        index for index, line in enumerate(lines) if line.rstrip("\r\n") == CRON_BEGIN
+    ]
+    end_indexes = [
+        index for index, line in enumerate(lines) if line.rstrip("\r\n") == CRON_END
+    ]
+    if len(begin_indexes) != len(end_indexes) or len(begin_indexes) > 1:
+        raise ValueError(f"Invalid router-watchdog markers in {path}")
+
+    managed = [
+        f"{CRON_BEGIN}\n",
+        *(f"{entry}\n" for entry in entries),
+        f"{CRON_END}\n",
+    ]
+    if begin_indexes:
+        begin, end = begin_indexes[0], end_indexes[0]
+        if end < begin:
+            raise ValueError(f"Invalid router-watchdog markers in {path}")
+        replacement = managed if entries else []
+        updated = "".join(lines[:begin] + replacement + lines[end + 1 :])
+    elif entries:
+        prefix = existing
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        updated = prefix + "".join(managed)
+    else:
+        return False
+
+    if updated == existing:
+        return False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    temporary_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            temporary_path = handle.name
+            handle.write(updated)
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+    return True
 
 
 class Mihomo:
@@ -486,9 +635,59 @@ def choose_and_apply(cfg: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument(
+        "--sync-cron",
+        action="store_true",
+        help="update this package's entries in the Entware root crontab",
+    )
+    action.add_argument(
+        "--remove-cron",
+        action="store_true",
+        help="remove this package's entries from the Entware root crontab",
+    )
+    if any(value in {"-h", "--help"} for value in sys.argv[1:]):
+        parser.print_help()
+        return 0
+    args = parser.parse_args()
+
+    if args.remove_cron:
+        try:
+            changed = update_managed_crontab(CRONTAB_PATH, [])
+            log(
+                "Removed router-watchdog cron entries."
+                if changed
+                else "No router-watchdog cron entries found."
+            )
+            return 0
+        except Exception as exc:
+            log(f"Failed to remove cron entries: {exc}")
+            return 1
+
     if not CONFIG_PATH.exists():
         print(f"Configuration file not found: {CONFIG_PATH}", file=sys.stderr)
         return 2
+
+    try:
+        with CONFIG_PATH.open(encoding="utf-8") as handle:
+            cfg = json.load(handle)
+        if not isinstance(cfg, dict):
+            raise ValueError("Configuration must be a JSON object")
+
+        if args.sync_cron:
+            entries = cron_entries(cfg.get("schedule", DEFAULT_SCHEDULE))
+            changed = update_managed_crontab(CRONTAB_PATH, entries)
+            if changed:
+                log(
+                    "Updated router-watchdog cron schedule."
+                    if entries
+                    else "Removed router-watchdog cron schedule."
+                )
+            return 0
+    except Exception as exc:
+        log(f"Error: {exc}")
+        return 1
 
     try:
         lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -497,11 +696,6 @@ def main() -> int:
         return 0
 
     try:
-        with CONFIG_PATH.open(encoding="utf-8") as handle:
-            cfg = json.load(handle)
-        if not isinstance(cfg, dict):
-            raise ValueError("Configuration must be a JSON object")
-
         choose_and_apply(cfg)
         return 0
     except Exception as exc:

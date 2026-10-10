@@ -21,14 +21,18 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_CONFIG", "/opt/etc/router-watchdog.json"))
-LOCK_PATH = Path("/opt/tmp/router-watchdog.lock")
-LOG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_LOG", "/opt/var/log/router-watchdog.log"))
-DEFAULT_CRONTAB_PATH = Path("/opt/var/spool/cron/crontabs/root")
-LEGACY_CRONTAB_PATH = Path("/opt/etc/crontabs/root")
+LOG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_LOG", "/opt/share/router-watchdog.log"))
+LOCK_PATH = ROOT / "router-watchdog.lock"
+DEFAULT_CRONTAB_PATH = Path("/opt/etc/crontab")
+LEGACY_CRONTAB_PATH = Path("/opt/var/spool/cron/crontabs/root")
+OLD_LEGACY_CRONTAB_PATH = Path("/opt/etc/crontabs/root")
 CRONTAB_PATH = Path(os.environ.get("ROUTER_WATCHDOG_CRONTAB", DEFAULT_CRONTAB_PATH))
 CRON_INIT_SCRIPT = Path("/opt/etc/init.d/S10cron")
 CRON_BEGIN = "# BEGIN router-watchdog managed entries"
 CRON_END = "# END router-watchdog managed entries"
+LOCKED_WATCHDOG_COMMAND = (
+    "/opt/bin/flock -n /tmp/router_watchdog.lock /opt/bin/router-watchdog"
+)
 DEFAULT_SCHEDULE = {
     "windows": [
         {"start": "07:00", "end": "01:00", "every_minutes": 1},
@@ -36,6 +40,11 @@ DEFAULT_SCHEDULE = {
     ]
 }
 
+
+class MihomoAPIError(RuntimeError):
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(f"Mihomo API: HTTP {status_code}: {detail}")
+        self.status_code = status_code
 
 def log(message: str) -> None:
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
@@ -138,11 +147,32 @@ def cron_entries(schedule: Any) -> list[str]:
 
     entries = [
         f"{cron_field(set(minutes), 59)} "
-        f"{cron_field(hours, 23)} * * * /opt/bin/router-watchdog"
+        f"{cron_field(hours, 23)} * * * root {LOCKED_WATCHDOG_COMMAND}"
         for minutes, hours in sorted(hours_by_minutes.items())
     ]
-    entries.append("59 6 * * 0 /opt/bin/router-watchdog --clear-log")
+    entries.append("59 6 * * 0 root /opt/bin/router-watchdog --clear-log")
     return entries
+
+
+def replace_text_file(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    temporary_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            temporary_path = handle.name
+            handle.write(contents)
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 def update_managed_crontab(path: Path, entries: list[str]) -> bool:
@@ -184,24 +214,43 @@ def update_managed_crontab(path: Path, entries: list[str]) -> bool:
     if updated == existing:
         return False
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
-    temporary_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            delete=False,
-        ) as handle:
-            temporary_path = handle.name
-            handle.write(updated)
-        os.chmod(temporary_path, mode)
-        os.replace(temporary_path, path)
-    finally:
-        if temporary_path and os.path.exists(temporary_path):
-            os.unlink(temporary_path)
+    replace_text_file(path, updated)
+    return True
+
+
+def is_watchdog_cron_entry(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    return (
+        "/opt/bin/router-watchdog" in stripped
+        or "/opt/libexec/router-watchdog/router_watchdog.py" in stripped
+    )
+
+
+def remove_legacy_watchdog_entries(path: Path) -> bool:
+    if path.is_symlink():
+        raise ValueError(f"Refusing to modify symlinked crontab: {path}")
+    if not path.exists():
+        return False
+    existing = path.read_text(encoding="utf-8")
+    lines = existing.splitlines(keepends=True)
+    updated_lines: list[str] = []
+    in_managed_block = False
+    for line in lines:
+        marker = line.rstrip("\r\n")
+        if marker == CRON_BEGIN:
+            in_managed_block = True
+        elif marker == CRON_END:
+            in_managed_block = False
+        if not in_managed_block and marker not in {CRON_BEGIN, CRON_END}:
+            if is_watchdog_cron_entry(line):
+                continue
+        updated_lines.append(line)
+    updated = "".join(updated_lines)
+    if updated == existing:
+        return False
+    replace_text_file(path, updated)
     return True
 
 
@@ -218,6 +267,8 @@ class Mihomo:
             raise ValueError("controller must start with http:// or https://")
         # API requests must bypass any system proxy.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self._provider_names: list[str] | None = None
+        self._provider_cache: dict[str, dict[str, Any]] = {}
         log(f"Mihomo controller: {self.base}")
 
     def request(
@@ -246,7 +297,7 @@ class Mihomo:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
-            raise RuntimeError(f"Mihomo API: HTTP {exc.code}: {detail}") from exc
+            raise MihomoAPIError(exc.code, detail) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Mihomo API is unavailable: {exc.reason}") from exc
 
@@ -272,15 +323,51 @@ class Mihomo:
         return value
 
     def provider(self, name: str) -> dict[str, Any]:
+        if name in self._provider_cache:
+            return self._provider_cache[name]
         path = "/providers/proxies/" + urllib.parse.quote(name, safe="")
         value = self.request("GET", path)
         if not isinstance(value, dict):
             raise RuntimeError(f"Unexpected response for proxy provider {name}")
+        self._provider_cache[name] = value
         return value
+
+    def provider_names(self) -> list[str]:
+        if self._provider_names is None:
+            value = self.request("GET", "/providers/proxies")
+            providers = value.get("providers") if isinstance(value, dict) else None
+            if not isinstance(providers, dict):
+                raise RuntimeError("Unexpected response for proxy providers")
+            self._provider_names = [
+                name for name in providers if isinstance(name, str) and name
+            ]
+        return self._provider_names
+
+    def providers_for_nodes(self, nodes: set[str]) -> dict[str, str]:
+        unresolved = set(nodes)
+        resolved: dict[str, str] = {}
+        for provider_name in self.provider_names():
+            if not unresolved:
+                break
+            data = self.provider(provider_name)
+            proxies = data.get("proxies")
+            if not isinstance(proxies, list):
+                raise RuntimeError(
+                    f"Provider {provider_name!r} does not contain a proxies list"
+                )
+            for proxy in proxies:
+                if not isinstance(proxy, dict):
+                    continue
+                name = proxy.get("name")
+                if isinstance(name, str) and name in unresolved:
+                    resolved[name] = provider_name
+                    unresolved.remove(name)
+        return resolved
 
     def update_provider(self, name: str) -> None:
         path = "/providers/proxies/" + urllib.parse.quote(name, safe="")
         self.request("PUT", path, timeout=30)
+        self._provider_cache.pop(name, None)
 
     def select(self, group: str, node: str, timeout: float = 5) -> None:
         path = "/proxies/" + urllib.parse.quote(group, safe="")
@@ -363,20 +450,28 @@ def provider_test_config(data: dict[str, Any]) -> tuple[str, int | None]:
         raise RuntimeError(f"Invalid provider expectedStatus: {expected!r}") from exc
 
 
-def refresh(client: Mihomo, providers: list[str]) -> None:
+def refresh(client: Mihomo, providers: list[str]) -> list[str]:
+    refreshed: list[str] = []
     for provider in providers:
         for attempt in range(1, 6):
             try:
                 client.update_provider(provider)
                 log(f"Provider {provider} refreshed (attempt {attempt}/5).")
+                refreshed.append(provider)
                 break
             except Exception as exc:
                 if attempt == 5:
-                    raise RuntimeError(
-                        f"Failed to refresh provider {provider} after 5 attempts: {exc}"
-                    ) from exc
+                    log(
+                        f"Skipping provider {provider} after 5 refresh attempts: {exc}"
+                    )
+                    break
                 log(f"Failed to refresh provider {provider}: {exc}; retrying in 2 seconds ({attempt}/5).")
                 time.sleep(2)
+    if not refreshed:
+        raise RuntimeError(
+            "Failed to refresh any proxy provider; cannot select fresh candidates"
+        )
+    return refreshed
 
 
 def current_node(client: Mihomo, group: str) -> str:
@@ -388,38 +483,38 @@ def current_node(client: Mihomo, group: str) -> str:
 
 
 def resolve_provider(client: Mihomo, node: str) -> str:
-    value = client.proxy(node)
-    provider = value.get("provider-name")
-    if isinstance(provider, str) and provider:
-        return provider
+    try:
+        value = client.proxy(node)
+    except MihomoAPIError as exc:
+        if exc.status_code != 404:
+            raise
+    else:
+        provider = value.get("provider-name")
+        if isinstance(provider, str) and provider:
+            return provider
+
+    providers = client.providers_for_nodes({node})
+    if node in providers:
+        return providers[node]
     raise RuntimeError(f"Provider not found for node {node!r}")
 
 
 def providers_from_target_group(client: Mihomo, group: str) -> list[str]:
-    """Derive provider names only from concrete nodes exposed by target_group."""
+    """Resolve target-group nodes against provider data without per-node proxy requests."""
     value = client.proxy_group(group)
     all_nodes = value.get("all")
     if not isinstance(all_nodes, list):
         raise RuntimeError(f"Group {group} does not contain an all list")
 
-    providers: set[str] = set()
-
-    def resolve(name: Any) -> str | None:
-        if not isinstance(name, str) or not name:
-            return None
-        try:
-            provider = client.proxy(name).get("provider-name")
-            return provider if isinstance(provider, str) and provider else None
-        except Exception as exc:
-            log(f"Failed to resolve provider for node {name!r}: {exc}")
-            return None
-
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        futures = [pool.submit(resolve, name) for name in all_nodes]
-        for future in futures:
-            provider = future.result()
-            if provider:
-                providers.add(provider)
+    nodes = {name for name in all_nodes if isinstance(name, str) and name}
+    resolved = client.providers_for_nodes(nodes)
+    providers = set(resolved.values())
+    unresolved = nodes - resolved.keys()
+    if unresolved:
+        log(
+            f"Nodes in target_group {group!r} not found in any proxy provider: "
+            + ", ".join(sorted(unresolved))
+        )
 
     result = sorted(providers)
     if not result:
@@ -432,10 +527,10 @@ def providers_from_target_group(client: Mihomo, group: str) -> list[str]:
 def check_current(
     client: Mihomo,
     node: str,
+    provider: str,
     providers_data: dict[str, dict[str, Any]],
     timeout_ms: int,
 ) -> bool:
-    provider = resolve_provider(client, node)
     data = providers_data[provider]
     url, expected = provider_test_config(data)
     try:
@@ -557,13 +652,15 @@ def choose_and_apply(cfg: dict[str, Any]) -> None:
     current_provider = resolve_provider(client, node)
     current_provider_data = client.provider(current_provider)
     current_provider_data_map = {current_provider: current_provider_data}
-    if check_current(client, node, current_provider_data_map, health_timeout):
+    if check_current(
+        client, node, current_provider, current_provider_data_map, health_timeout
+    ):
         log("Current node is healthy. No switch is required.")
         return
 
     log("Current node failed the fresh healthcheck; starting candidate selection.")
     providers = providers_from_target_group(client, group)
-    refresh(client, providers)
+    providers = refresh(client, providers)
     nodes, provider_data = collect_nodes(client, providers)
 
     # Initial ranking: ONLY the last history latency, exactly as requested.
@@ -660,18 +757,34 @@ def choose_and_apply(cfg: dict[str, Any]) -> None:
     )
 
 
+def sync_cron(entries: list[str]) -> bool:
+    changed = remove_legacy_watchdog_entries(CRONTAB_PATH)
+    changed = update_managed_crontab(CRONTAB_PATH, entries) or changed
+
+    for path in (LEGACY_CRONTAB_PATH, OLD_LEGACY_CRONTAB_PATH):
+        if path == CRONTAB_PATH:
+            continue
+        path_changed = remove_legacy_watchdog_entries(path)
+        path_changed = update_managed_crontab(path, []) or path_changed
+        changed = path_changed or changed
+
+    if changed:
+        restart_cron()
+    return changed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group()
     action.add_argument(
         "--sync-cron",
         action="store_true",
-        help="update this package's entries in the Entware root crontab",
+        help="synchronize this package's entries in /opt/etc/crontab",
     )
     action.add_argument(
         "--remove-cron",
         action="store_true",
-        help="remove this package's entries from the Entware root crontab",
+        help="remove this package's cron entries",
     )
     action.add_argument(
         "--clear-log",
@@ -692,14 +805,7 @@ def main() -> int:
 
     if args.remove_cron:
         try:
-            active_changed = update_managed_crontab(CRONTAB_PATH, [])
-            changed = active_changed
-            if CRONTAB_PATH == DEFAULT_CRONTAB_PATH:
-                changed = (
-                    update_managed_crontab(LEGACY_CRONTAB_PATH, []) or changed
-                )
-            if active_changed:
-                restart_cron()
+            changed = sync_cron([])
             log(
                 "Removed router-watchdog cron entries."
                 if changed
@@ -710,26 +816,17 @@ def main() -> int:
             log(f"Failed to remove cron entries: {exc}")
             return 1
 
-    if not CONFIG_PATH.exists():
-        log(f"Configuration file not found: {CONFIG_PATH}")
-        return 2
-
-    try:
-        with CONFIG_PATH.open(encoding="utf-8") as handle:
-            cfg = json.load(handle)
-        if not isinstance(cfg, dict):
-            raise ValueError("Configuration must be a JSON object")
-
-        if args.sync_cron:
+    if args.sync_cron:
+        if not CONFIG_PATH.exists():
+            log(f"Configuration file not found: {CONFIG_PATH}")
+            return 2
+        try:
+            with CONFIG_PATH.open(encoding="utf-8") as handle:
+                cfg = json.load(handle)
+            if not isinstance(cfg, dict):
+                raise ValueError("Configuration must be a JSON object")
             entries = cron_entries(cfg.get("schedule", DEFAULT_SCHEDULE))
-            active_changed = update_managed_crontab(CRONTAB_PATH, entries)
-            changed = active_changed
-            if CRONTAB_PATH == DEFAULT_CRONTAB_PATH:
-                changed = (
-                    update_managed_crontab(LEGACY_CRONTAB_PATH, []) or changed
-                )
-            if active_changed:
-                restart_cron()
+            changed = sync_cron(entries)
             if changed:
                 log(
                     "Updated router-watchdog cron schedule."
@@ -737,28 +834,43 @@ def main() -> int:
                     else "Removed router-watchdog cron schedule."
                 )
             return 0
-    except Exception as exc:
-        log(f"Error: {exc}")
-        return 1
+        except Exception as exc:
+            log(f"Failed to synchronize cron schedule: {exc}")
+            return 1
 
+    if not CONFIG_PATH.exists():
+        log(f"Configuration file not found: {CONFIG_PATH}")
+        return 2
     try:
-        lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         log("Previous run is still in progress; skipping.")
         return 0
+    except OSError as exc:
+        log(f"Failed to create watchdog lock {LOCK_PATH}: {exc}")
+        return 1
 
     try:
+        with CONFIG_PATH.open(encoding="utf-8") as handle:
+            cfg = json.load(handle)
+        if not isinstance(cfg, dict):
+            raise ValueError("Configuration must be a JSON object")
+
         choose_and_apply(cfg)
         return 0
     except Exception as exc:
         log(f"Error: {exc}")
         return 1
     finally:
-        os.close(lock_fd)
         try:
-            LOCK_PATH.unlink()
-        except FileNotFoundError:
-            pass
+            os.close(lock_fd)
+        finally:
+            try:
+                LOCK_PATH.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log(f"Failed to remove watchdog lock {LOCK_PATH}: {exc}")
 
 
 if __name__ == "__main__":

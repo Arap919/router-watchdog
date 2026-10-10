@@ -164,15 +164,15 @@ vi /opt/etc/router-watchdog.json
 
 Set at least `target_group` to the name of a Mihomo selector group. The full
 configuration example and schedule options are documented below. Ensure
-Entware's `crond` is running and reads `/opt/var/spool/cron/crontabs/root`;
-otherwise the scheduled watchdog runs will not execute.
+Entware's `crond` is running and reads `/opt/etc/crontab`; otherwise the
+scheduled watchdog runs will not execute.
 
-Execution logs are appended to `/opt/var/log/router-watchdog.log`. The managed
+Execution logs are appended to `/opt/share/router-watchdog.log`. The managed
 crontab also truncates this file every Sunday at 06:59 router-local time. To
 inspect the log:
 
 ```sh
-tail -f /opt/var/log/router-watchdog.log
+tail -f /opt/share/router-watchdog.log
 ```
 
 The package installs:
@@ -184,12 +184,18 @@ The package installs:
 /opt/etc/cron.1min/router-watchdog
 ```
 
-The package also updates its managed entries in
-`/opt/var/spool/cron/crontabs/root`, BusyBox `crond`'s default root crontab.
-When synchronizing after an upgrade, it removes the old managed block from
-`/opt/etc/crontabs/root` while preserving other entries there.
-Whenever synchronization changes the active root crontab, the package restarts
+The package synchronizes its managed entries in `/opt/etc/crontab`, the
+system-wide Entware crontab format used by this installation. Each generated
+entry includes the `root` user field. This differs from `crontab -l`, which
+reads the per-user spool file `/opt/var/spool/cron/crontabs/root` and uses
+five-field entries without a username. The package removes its old managed
+entries from the per-user spool and `/opt/etc/crontabs/root` while preserving
+unrelated jobs.
+
+When synchronization changes the system crontab, the package restarts
 `/opt/etc/init.d/S10cron`; an unchanged schedule does not restart the service.
+The one-minute `cron.1min` hook runs `--sync-cron`, so configuration schedule
+changes are applied automatically.
 
 The configuration file is registered as a package conffile, so package
 upgrades do not silently replace a modified `/opt/etc/router-watchdog.json`.
@@ -200,11 +206,21 @@ upgrades do not silently replace a modified `/opt/etc/router-watchdog.json`.
 /opt/bin/router-watchdog
 ```
 
-The watchdog also prevents overlapping runs with:
+Scheduled watchdog runs prevent overlap with Entware `flock` using:
 
 ```text
-/opt/tmp/router-watchdog.lock
+/opt/bin/flock -n /tmp/router_watchdog.lock
 ```
+
+The script also creates an exclusive lock file next to its Python source before
+starting work and removes it in `finally`. This second guard prevents a manual
+run or another invocation that bypasses cron's `flock` from overlapping; a
+skipped invocation is recorded in the log. The cron lock covers scheduled
+commands, while the script lock covers every entry point.
+
+Both manual and scheduled runs append to `/opt/share/router-watchdog.log`.
+Messages are also printed to stdout. Cron commands do not redirect stdout to
+the same file, avoiding duplicate log lines.
 
 ## Configuration
 
@@ -279,8 +295,8 @@ For example, to run every five minutes from 07:00 until 01:00 and every
 }
 ```
 
-The package writes only its marked block in
-`/opt/var/spool/cron/crontabs/root`; other crontab entries are left unchanged.
+The package writes only its marked block in `/opt/etc/crontab`; other crontab
+entries are left unchanged.
 The package's `cron.1min` hook synchronizes the managed entries after a
 configuration edit, normally within one minute. When the generated schedule
 changes, synchronization restarts the Entware cron service so the new schedule
@@ -547,11 +563,10 @@ currently selected node is healthy.
 ## Cron
 
 The package keeps using the existing Entware/Keenetic `cron.1min` hook, but it
-now uses that hook only to synchronize the configured schedule. The actual
-watchdog runs are native entries in
-`/opt/var/spool/cron/crontabs/root`, generated from `schedule.windows`.
-Entware `crond` must be enabled and configured to read that directory (the
-default for the installed BusyBox `crond`).
+uses that hook only to synchronize the configured schedule. Actual watchdog
+runs are entries in `/opt/etc/crontab`, generated from `schedule.windows` in
+system-crontab format with a `root` user field. Entware `crond` must be enabled
+and configured to read this file.
 
 The hook is:
 
@@ -562,9 +577,9 @@ The hook is:
 It is expected that Entware already runs `run-parts` for this directory every
 minute. Package installation creates the initial crontab entries, and later
 configuration edits are synchronized by the hook. Removing the package removes
-only its marked entries from the root crontab. A separate managed cron entry
-clears `/opt/var/log/router-watchdog.log` every Sunday at 06:59 router-local
-time.
+its managed entries and legacy watchdog commands from the cron files. A
+separate managed cron entry clears `/opt/share/router-watchdog.log` every
+Sunday at 06:59 router-local time.
 
 ## License
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -22,7 +23,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_CONFIG", "/opt/etc/router-watchdog.json"))
 LOG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_LOG", "/opt/share/router-watchdog.log"))
-LOCK_PATH = ROOT / "router-watchdog.lock"
+LOCK_PATH = Path("/tmp/router_watchdog.lock")
 DEFAULT_CRONTAB_PATH = Path("/opt/etc/crontab")
 LEGACY_CRONTAB_PATH = Path("/opt/var/spool/cron/crontabs/root")
 OLD_LEGACY_CRONTAB_PATH = Path("/opt/etc/crontabs/root")
@@ -31,7 +32,7 @@ CRON_INIT_SCRIPT = Path("/opt/etc/init.d/S10cron")
 CRON_BEGIN = "# BEGIN router-watchdog managed entries"
 CRON_END = "# END router-watchdog managed entries"
 LOCKED_WATCHDOG_COMMAND = (
-    "/opt/bin/flock -n /tmp/router_watchdog.lock /opt/bin/router-watchdog"
+    "/opt/bin/router-watchdog"
 )
 DEFAULT_SCHEDULE = {
     "windows": [
@@ -868,15 +869,18 @@ def main() -> int:
         log(f"Configuration file not found: {CONFIG_PATH}")
         return 2
     try:
-        lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        log("Previous run is still in progress; skipping.")
-        return 0
+        lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_WRONLY, 0o600)
     except OSError as exc:
         log(f"Failed to create watchdog lock {LOCK_PATH}: {exc}")
         return 1
 
     try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            log(f"Lock acquired: {LOCK_PATH}, PID={os.getpid()}")
+        except BlockingIOError:
+            log("Previous run is still in progress; skipping.")
+            return 0
         with CONFIG_PATH.open(encoding="utf-8") as handle:
             cfg = json.load(handle)
         if not isinstance(cfg, dict):
@@ -888,15 +892,7 @@ def main() -> int:
         log(f"Error: {exc}")
         return 1
     finally:
-        try:
-            os.close(lock_fd)
-        finally:
-            try:
-                LOCK_PATH.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                log(f"Failed to remove watchdog lock {LOCK_PATH}: {exc}")
+        os.close(lock_fd)
 
 
 if __name__ == "__main__":

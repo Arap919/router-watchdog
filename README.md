@@ -206,17 +206,18 @@ upgrades do not silently replace a modified `/opt/etc/router-watchdog.json`.
 /opt/bin/router-watchdog
 ```
 
-Scheduled watchdog runs prevent overlap with Entware `flock` using:
+Ручной запуск и запуск из cron используют одну неблокирующую блокировку
+`fcntl.flock` внутри Python на файле:
 
 ```text
-/opt/bin/flock -n /tmp/router_watchdog.lock
+/tmp/router_watchdog.lock
 ```
 
-The script also creates an exclusive lock file next to its Python source before
-starting work and removes it in `finally`. This second guard prevents a manual
-run or another invocation that bypasses cron's `flock` from overlapping; a
-skipped invocation is recorded in the log. The cron lock covers scheduled
-commands, while the script lock covers every entry point.
+Если блокировка занята, скрипт записывает пропуск запуска в лог и завершает работу.
+Файл не удаляется: блокировка освобождается при закрытии дескриптора или завершении
+процесса. Команда cron запускает `/opt/bin/router-watchdog` напрямую.
+После обновления старой установки синхронизируйте cron командой
+`/opt/bin/router-watchdog --sync-cron`, чтобы убрать внешний `flock`.
 
 Both manual and scheduled runs append to `/opt/share/router-watchdog.log`.
 Messages are also printed to stdout. Cron commands do not redirect stdout to

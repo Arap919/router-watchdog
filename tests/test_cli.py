@@ -36,6 +36,44 @@ class TestRouterWatchdogCli(unittest.TestCase):
 
 
 class TestProviderResolution(unittest.TestCase):
+    def test_group_healthcheck_refreshes_history_and_excludes_other_nodes(self):
+        data = {
+            "testUrl": "https://example.com/check",
+            "expectedStatus": 204,
+            "proxies": [
+                {"name": "node-a", "alive": False, "history": []},
+                {"name": "node-b", "alive": False, "history": []},
+                {"name": "outside-group", "alive": False, "history": []},
+            ],
+        }
+        refreshed = {
+            **data,
+            "proxies": [
+                {"name": "node-a", "alive": True, "history": [{"delay": 42}]},
+                data["proxies"][1],
+                data["proxies"][2],
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(module, "LOG_PATH", pathlib.Path(directory) / "watchdog.log"):
+                client = module.Mihomo("http://localhost:9090")
+                client._provider_cache["provider"] = data
+                with (
+                    mock.patch.object(client, "proxy_group", return_value={"all": ["node-a", "node-b"]}),
+                    mock.patch.object(client, "provider_healthcheck", side_effect=[42, RuntimeError("offline")]) as healthcheck,
+                    mock.patch.object(client, "request", return_value=refreshed) as request,
+                ):
+                    module.check_group_nodes(client, "selector", ["provider"], 1000, 1)
+                    nodes, _ = module.collect_nodes(client, ["provider"])
+
+        self.assertEqual(healthcheck.call_args_list, [
+            mock.call("provider", "node-a", data["testUrl"], 1000, 204),
+            mock.call("provider", "node-b", data["testUrl"], 1000, 204),
+        ])
+        request.assert_called_once_with("GET", "/providers/proxies/provider")
+        self.assertTrue(nodes[0]["alive"])
+        self.assertEqual(nodes[0]["last_delay"], 42)
+
     def test_refresh_skips_provider_after_retries_and_keeps_successful_provider(self):
         class Client:
             def __init__(self):

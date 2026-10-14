@@ -56,6 +56,30 @@ jobs:
             https://github.com/Entware/docker.git \
             entware-docker
 
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("entware-docker/Dockerfile")
+          text = path.read_text()
+          needle = "USER me"
+          if text.count(needle) != 1:
+              raise SystemExit("Expected Entware Dockerfile USER section was not found")
+
+          python2 = """RUN curl -fL https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tar.xz -o /tmp/Python-2.7.18.tar.xz && \\
+              echo 'b62c0e7937551d0cc02b8fd5cb0f544f9405bafc9a54d3808ed4594812edef43  /tmp/Python-2.7.18.tar.xz' | sha256sum -c - && \\
+              tar -xJf /tmp/Python-2.7.18.tar.xz -C /tmp && \\
+              cd /tmp/Python-2.7.18 && \\
+              ./configure --prefix=/opt/python2 --with-ensurepip=no && \\
+              make -j2 && make altinstall && \\
+              ln -s python2.7 /opt/python2/bin/python2 && \\
+              /opt/python2/bin/python2 --version && \\
+              rm -rf /tmp/Python-2.7.18 /tmp/Python-2.7.18.tar.xz
+          ENV PATH="/opt/python2/bin:$PATH"
+
+          """
+          path.write_text(text.replace(needle, python2 + needle, 1))
+          PY
+
           docker build \
             --pull \
             --tag entware-builder \

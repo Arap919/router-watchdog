@@ -559,6 +559,31 @@ def fresh_check(
         return name, None
 
 
+def check_group_nodes(
+    client: Mihomo, group: str, providers: list[str], timeout_ms: int, workers: int
+) -> None:
+    group_nodes = set(client.proxy_group(group)["all"])
+    failed = 0
+    total = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = []
+        for provider in providers:
+            data = client.provider(provider)
+            for item in provider_nodes(data, provider):
+                if item["name"] in group_nodes:
+                    futures.append(pool.submit(fresh_check, client, item, data, timeout_ms))
+        total = len(futures)
+        for future in as_completed(futures):
+            _, delay = future.result()
+            if delay is None:
+                failed += 1
+
+    # Reload provider history after all healthchecks have completed.
+    for provider in providers:
+        client._provider_cache.pop(provider, None)
+    log(f"Fresh healthcheck for group {group}: OK={total - failed}, FAIL={failed}, total={total}.")
+
+
 def download(proxy: str, bytes_to_get: int, connect_timeout: int) -> int:
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": proxy, "https": proxy})
@@ -661,6 +686,7 @@ def choose_and_apply(cfg: dict[str, Any]) -> None:
     log("Current node failed the fresh healthcheck; starting candidate selection.")
     providers = providers_from_target_group(client, group)
     providers = refresh(client, providers)
+    check_group_nodes(client, group, providers, health_timeout, workers)
     nodes, provider_data = collect_nodes(client, providers)
 
     # Initial ranking: ONLY the last history latency, exactly as requested.

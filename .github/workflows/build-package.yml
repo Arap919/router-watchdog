@@ -56,35 +56,6 @@ jobs:
             https://github.com/Entware/docker.git \
             entware-docker
 
-          cd entware-docker
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("Dockerfile")
-          text = path.read_text()
-
-          needle = "apt-get update && \\"
-
-          replacement = """find /etc/apt -type f \\
-            \\( -name '*.list' -o -name '*.sources' \\) \\
-            -exec sed -i 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' {} + && \\
-          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until && \\
-          apt-get update && \\"""
-
-          if needle not in text:
-              raise SystemExit(
-                  "Expected Entware Dockerfile apt section was not found"
-              )
-
-          path.write_text(text.replace(needle, replacement, 1))
-          PY
-
-          echo "=== Patched Dockerfile ==="
-          cat Dockerfile
-
-          cd ..
-
           docker build \
             --pull \
             --tag entware-builder \

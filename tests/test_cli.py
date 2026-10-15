@@ -245,7 +245,7 @@ class TestCronSchedule(unittest.TestCase):
             [
                 "* 0,7-23 * * * root /opt/bin/router-watchdog",
                 "0,30 1-6 * * * root /opt/bin/router-watchdog",
-                "59 6 * * 0 root /opt/bin/router-watchdog --clear-log",
+                "59 6 * * * root /opt/bin/router-watchdog --clear-log --if-due",
             ],
         )
 
@@ -263,14 +263,14 @@ class TestCronSchedule(unittest.TestCase):
             [
                 "0,5 0 * * * root /opt/bin/router-watchdog",
                 "55 23 * * * root /opt/bin/router-watchdog",
-                "59 6 * * 0 root /opt/bin/router-watchdog --clear-log",
+                "59 6 * * * root /opt/bin/router-watchdog --clear-log --if-due",
             ],
         )
 
     def test_empty_windows_disable_schedule(self):
         self.assertEqual(
             module.cron_entries({"windows": []}),
-            ["59 6 * * 0 root /opt/bin/router-watchdog --clear-log"],
+            ["59 6 * * * root /opt/bin/router-watchdog --clear-log --if-due"],
         )
 
     def test_scheduled_watchdog_entries_use_internal_lock(self):
@@ -303,7 +303,7 @@ class TestCronSchedule(unittest.TestCase):
             ),
             [
                 "* * * * * root /opt/bin/router-watchdog",
-                "59 6 * * 0 root /opt/bin/router-watchdog --clear-log",
+                "59 6 * * * root /opt/bin/router-watchdog --clear-log --if-due",
             ],
         )
 

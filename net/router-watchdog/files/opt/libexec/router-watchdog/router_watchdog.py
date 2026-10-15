@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import math
 import os
 import re
 import subprocess
@@ -66,6 +67,37 @@ def clear_log() -> None:
         print(f"Failed to clear log file {LOG_PATH}: {exc}", file=sys.stderr)
         raise
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} Cleared log file {LOG_PATH}.")
+
+
+def cleanup_days(cfg: dict[str, Any]) -> int:
+    value = cfg.get("log_cleanup_days", 3)
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 3650:
+        raise ValueError("log_cleanup_days must be an integer between 1 and 3650")
+    return value
+
+
+def cleanup_log(days: int | None = None) -> None:
+    """Called under the common watchdog lock; None means unconditional clear."""
+    state = LOG_PATH.with_name(LOG_PATH.name + ".cleanup")
+    now = time.time()
+    if state.is_symlink():
+        raise ValueError("Refusing symlinked log-cleanup state")
+    if days is not None:
+        if not state.exists():
+            replace_text_file(state, f"{now}\n")
+            print("Initialized log-cleanup interval; existing log retained.", flush=True)
+            return
+        try:
+            last = float(state.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError) as exc:
+            raise ValueError("Cannot read log-cleanup timestamp") from exc
+        if not math.isfinite(last) or last < 0:
+            raise ValueError("Invalid log-cleanup timestamp")
+        if now - last < days * 86400:
+            print("Log cleanup is not due.", flush=True)
+            return
+    clear_log()
+    replace_text_file(state, f"{now}\n")
 
 
 def number(cfg: dict[str, Any], key: str, low: int, high: int) -> int:
@@ -151,7 +183,7 @@ def cron_entries(schedule: Any) -> list[str]:
         f"{cron_field(hours, 23)} * * * root {LOCKED_WATCHDOG_COMMAND}"
         for minutes, hours in sorted(hours_by_minutes.items())
     ]
-    entries.append("59 6 * * 0 root /opt/bin/router-watchdog --clear-log")
+    entries.append("59 6 * * * root /opt/bin/router-watchdog --clear-log --if-due")
     return entries
 
 
@@ -297,8 +329,9 @@ class Mihomo:
             with self.opener.open(request, timeout=timeout) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:300]
-            raise MihomoAPIError(exc.code, detail) from exc
+            # Provider refresh errors can contain private subscription URLs.
+            exc.close()
+            raise MihomoAPIError(exc.code, "controller request failed") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Mihomo API is unavailable: {exc.reason}") from exc
 
@@ -596,11 +629,11 @@ def download(proxy: str, bytes_to_get: int, connect_timeout: int) -> int:
     )
     received = 0
     with opener.open(request, timeout=connect_timeout) as response:
-        try:
-            response.fp.raw._sock.settimeout(None)
-        except (AttributeError, OSError):
-            pass
-        while chunk := response.read(128 * 1024):
+        # Keep the socket timeout: a stalled download must not hold the lock forever.
+        while received < bytes_to_get:
+            chunk = response.read(min(128 * 1024, bytes_to_get - received))
+            if not chunk:
+                break
             received += len(chunk)
     if received < bytes_to_get * 0.8:
         raise RuntimeError(f"Speed test received only {received / 1_000_000:.1f} MB")
@@ -617,8 +650,11 @@ def median(values: list[float]) -> float:
 
 def measure_speed(client: Mihomo, cfg: dict[str, Any], node: str) -> float:
     timeout = number(cfg, "speed_connect_timeout_seconds", 1, 30)
-    group = str(cfg["target_group"])
+    group = str(cfg.get("benchmark_group", "BENCHMARK"))
+    if group == cfg["target_group"]:
+        raise ValueError("benchmark_group must differ from target_group")
     client.select(group, node, timeout)
+    log(f"Benchmark selector {group}: selected {node}.")
     time.sleep(float(cfg.get("switch_wait_seconds", 0.7)))
 
     proxy = str(cfg["benchmark_proxy"])
@@ -627,14 +663,17 @@ def measure_speed(client: Mihomo, cfg: dict[str, Any], node: str) -> float:
     rounds = number(cfg, "multi_rounds", 1, 4)
     values: list[float] = []
 
-    for _ in range(rounds):
+    for round_index in range(rounds):
+        log(f"Speed-test round {round_index + 1}/{rounds}: {node}, {streams} streams.")
         started = time.monotonic()
         with ThreadPoolExecutor(max_workers=streams) as pool:
             received = sum(
                 pool.map(lambda _: download(proxy, size, timeout), range(streams))
             )
         elapsed = time.monotonic() - started
-        values.append(received * 8 / elapsed / 1_000_000)
+        speed = received * 8 / elapsed / 1_000_000
+        values.append(speed)
+        log(f"Speed-test round {round_index + 1}/{rounds}: {node}, {speed:.2f} Mbps.")
 
     return median(values)
 
@@ -661,127 +700,212 @@ def collect_nodes(
     return list(unique.values()), provider_data
 
 
-def choose_and_apply(cfg: dict[str, Any]) -> None:
-    client = Mihomo(str(cfg["controller"]), str(cfg.get("secret", "")))
-    group = str(cfg["target_group"])
-    health_timeout = number(cfg, "healthcheck_timeout_ms", 250, 10000)
-    workers = number(cfg, "healthcheck_parallelism", 1, 32)
-
-    node = current_node(client, group)
-    log(f"Current node in group {group}: {node}")
-
-    # The current node is ALWAYS checked with a fresh provider healthcheck.
-    # Do not use alive/history here: they may be stale because provider healthcheck
-    # runs every 5 minutes and lazy providers may not check unused nodes.
-    # No /proxies/<node>/delay: provider-owned nodes are checked through
-    # /providers/proxies/{provider}/{node}/healthcheck.
-    current_provider = resolve_provider(client, node)
-    current_provider_data = client.provider(current_provider)
-    current_provider_data_map = {current_provider: current_provider_data}
-    if check_current(
-        client, node, current_provider, current_provider_data_map, health_timeout
+def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    defaults = {
+        "benchmark_group": "BENCHMARK", "benchmark_proxy": "http://127.0.0.1:17890",
+        "top_n": 7, "healthcheck_parallelism": 6, "healthcheck_timeout_ms": 5000,
+        "speed_connect_timeout_seconds": 5, "switch_wait_seconds": 0.7,
+        "download_bytes": 25000000, "parallel_streams": 4, "multi_rounds": 2,
+        "log_cleanup_days": 3,
+    }
+    result = {**defaults, **cfg}
+    for key in ("controller", "target_group", "benchmark_group", "benchmark_proxy"):
+        value = result.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{key} must be a nonempty string")
+    for key in ("controller", "benchmark_proxy"):
+        parsed = urllib.parse.urlparse(result[key])
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError(f"{key} must be an HTTP(S) URL with a host")
+        if parsed.username or parsed.password:
+            raise ValueError(f"{key} must not contain URL credentials")
+        try:
+            parsed.port
+        except ValueError as exc:
+            raise ValueError(f"{key} has an invalid port") from exc
+    if result["target_group"] == result["benchmark_group"]:
+        raise ValueError("benchmark_group must differ from target_group")
+    if not isinstance(result.get("secret", ""), str):
+        raise ValueError("secret must be a string")
+    for key, low, high in (
+        ("top_n", 1, 50), ("healthcheck_parallelism", 1, 32),
+        ("healthcheck_timeout_ms", 250, 10000), ("speed_connect_timeout_seconds", 1, 30),
+        ("download_bytes", 1000000, 200000000), ("parallel_streams", 1, 8),
+        ("multi_rounds", 1, 4), ("log_cleanup_days", 1, 3650),
     ):
-        log("Current node is healthy. No switch is required.")
-        return
+        if isinstance(result[key], bool) or not isinstance(result[key], int):
+            raise ValueError(f"{key} must be an integer")
+        number(result, key, low, high)
+    wait = result["switch_wait_seconds"]
+    if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or wait < 0:
+        raise ValueError("switch_wait_seconds must be a finite nonnegative number")
+    cron_entries(result.get("schedule", DEFAULT_SCHEDULE))
+    return result
 
-    log("Current node failed the fresh healthcheck; starting candidate selection.")
-    providers = providers_from_target_group(client, group)
-    providers = refresh(client, providers)
-    check_group_nodes(client, group, providers, health_timeout, workers)
-    nodes, provider_data = collect_nodes(client, providers)
 
-    # Initial ranking: ONLY the last history latency, exactly as requested.
-    historical = [
-        item for item in nodes
-        if item["alive"] and item["last_delay"] is not None
-    ]
-    historical.sort(key=lambda item: int(item["last_delay"]))
-    top_n = number(cfg, "top_n", 1, 50)
-    shortlist = historical[:top_n]
+def target_candidates(
+    client: Mihomo, group: str,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    value = client.proxy_group(group)
+    if value.get("type") != "Selector":
+        raise RuntimeError(f"target_group {group!r} must be a Selector")
+    members = value.get("all")
+    if not isinstance(members, list):
+        raise RuntimeError(f"Group {group!r} does not contain an all list")
+    # Unicode escapes keep technical source ASCII without changing name matching.
+    excluded = ("\u0440\u043e\u0441\u0441\u0438\u044f", "\u0443\u043a\u0440\u0430\u0438\u043d\u0430")
+    allowed = []
+    for name in members:
+        if not isinstance(name, str) or not name:
+            continue
+        if any(word in name.casefold() for word in excluded):
+            log(f"Excluded node by country name: {name}")
+        else:
+            allowed.append(name)
+    wanted = set(allowed)
+    found: dict[str, dict[str, Any]] = {}
+    data_map: dict[str, dict[str, Any]] = {}
+    for provider in client.provider_names():
+        try:
+            data = client.provider(provider)
+            items = [item for item in provider_nodes(data, provider) if item["name"] in wanted]
+            if items:
+                provider_test_config(data)
+                data_map[provider] = data
+                for item in items:
+                    found.setdefault(item["name"], item)
+        except Exception as exc:
+            log(f"Cannot read eligible nodes from provider {provider}: {exc}")
+    nodes = [found[name] for name in dict.fromkeys(allowed) if name in found]
+    log(f"Eligible provider-backed members of {group}: {len(nodes)}.")
+    return nodes, data_map
 
-    log(
-        "Top {} by latest history.delay: {}".format(
-            top_n,
-            ", ".join(
-                f'{item["name"]} ({item["last_delay"]} ms)'
-                for item in shortlist
-            ) or "no candidates",
-        )
-    )
 
-    if not shortlist:
-        raise RuntimeError("No nodes with a positive latest history.delay")
+def restore_service(
+    client: Mihomo, cfg: dict[str, Any], nodes: list[dict[str, Any]],
+    data: dict[str, dict[str, Any]],
+) -> str | None:
+    log("Looking for the first freshly confirmed emergency fallback.")
+    for item in nodes:
+        name, delay = fresh_check(client, item, data[item["provider"]], cfg["healthcheck_timeout_ms"])
+        if delay is not None:
+            client.select(cfg["target_group"], name)
+            log(f"Emergency fallback selected: {name}, {delay} ms.")
+            return name
+    log("No working emergency fallback found; subscription recovery is required.")
+    return None
 
-    # Fresh-check the shortlist. If 3+ of these fail, assume the cached
-    # provider health state is unreliable and check every concrete proxy.
-    def check(item: dict[str, Any]) -> tuple[str, int | None]:
-        return fresh_check(client, item, provider_data[str(item["provider"])], health_timeout)
 
-    checked: list[tuple[dict[str, Any], int]] = []
-    failed = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(check, item): item for item in shortlist}
+def check_candidates(
+    client: Mihomo, cfg: dict[str, Any], nodes: list[dict[str, Any]],
+    data: dict[str, dict[str, Any]], restore: bool = False,
+) -> list[tuple[dict[str, Any], int]]:
+    checked = []
+    restored = False
+    with ThreadPoolExecutor(max_workers=cfg["healthcheck_parallelism"]) as pool:
+        futures = {
+            pool.submit(fresh_check, client, item, data[item["provider"]],
+                        cfg["healthcheck_timeout_ms"]): item for item in nodes
+        }
         for future in as_completed(futures):
             item = futures[future]
             name, delay = future.result()
-            if delay is None:
-                failed += 1
-            else:
+            if delay is not None:
                 checked.append((item, delay))
+                log(f"Fresh healthcheck OK: {name}, {delay} ms.")
+                if restore and not restored:
+                    client.select(cfg["target_group"], name)
+                    log(f"Emergency fallback selected after refresh: {name}, {delay} ms.")
+                    restored = True
+    checked.sort(key=lambda entry: (entry[1], str(entry[0]["name"])))
+    log(f"Fresh healthchecks: OK={len(checked)}, FAIL={len(nodes) - len(checked)}.")
+    return checked
 
-    log(f"Fresh healthcheck for top-{len(shortlist)}: OK={len(checked)}, FAIL={failed}.")
 
-    if failed >= 3:
-        log("3 or more candidates failed the fresh healthcheck; running a full fresh healthcheck for all proxies.")
-        checked = []
-        failed_all = 0
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(check, item): item for item in nodes}
-            for future in as_completed(futures):
-                item = futures[future]
-                _, delay = future.result()
-                if delay is None:
-                    failed_all += 1
-                else:
-                    checked.append((item, delay))
-        log(f"Full fresh healthcheck: OK={len(checked)}, FAIL={failed_all}, total={len(nodes)}.")
+def choose_winner(results: list[tuple[str, int, float]]) -> tuple[str, int, float]:
+    valid = [r for r in results if r[1] > 0 and math.isfinite(r[2]) and r[2] > 0]
+    if not valid:
+        raise RuntimeError("Failed to measure speed for any candidate")
+    minimum_delay = min(r[1] for r in valid)
+    eligible = [r for r in valid if r[1] <= minimum_delay + 50]
+    return min(eligible, key=lambda r: (-r[2], r[1], r[0]))
 
-    if not checked:
-        raise RuntimeError("No available nodes remain after the fresh healthcheck")
 
-    checked.sort(key=lambda value: value[1])
-    fresh_top_n = number(cfg, "fresh_top_n", 1, 30)
-    finalists = checked[:fresh_top_n]
-    log(
-        "Speed-test candidates: "
-        + ", ".join(f"{item['name']} ({delay} ms)" for item, delay in finalists)
-    )
-
-    tested: list[tuple[str, int, float]] = []
-    for item, delay in finalists:
+def benchmark_candidates(
+    client: Mihomo, cfg: dict[str, Any], checked: list[tuple[dict[str, Any], int]],
+) -> tuple[str, int, float] | None:
+    benchmark = client.proxy_group(cfg["benchmark_group"])
+    if benchmark.get("type") != "Selector" or not isinstance(benchmark.get("all"), list):
+        raise RuntimeError("benchmark_group must be a Selector with an all list")
+    members = set(benchmark["all"])
+    results = []
+    for item, delay in checked:
         name = str(item["name"])
+        if name not in members:
+            log(f"Skipping speed test: {name} is missing from benchmark_group.")
+            continue
         try:
             speed = measure_speed(client, cfg, name)
-            tested.append((name, delay, speed))
-            log(f"Speed {name}: {speed:.2f} Mbps, healthcheck {delay} ms")
+            if not math.isfinite(speed) or speed <= 0:
+                raise RuntimeError("Nonpositive or nonfinite throughput")
+            results.append((name, delay, speed))
+            log(f"Speed {name}: {speed:.2f} Mbps, fresh delay {delay} ms.")
         except Exception as exc:
             log(f"Speed-test failed for {name}: {exc}")
+    return choose_winner(results) if results else None
 
-    if not tested:
-        raise RuntimeError("Failed to measure speed for any finalist")
 
-    # Highest speed wins. If speeds are close, lower fresh latency wins.
-    tested.sort(key=lambda value: value[2], reverse=True)
-    tolerance = number(cfg, "close_result_percent", 0, 50) / 100
-    best_speed = tested[0][2]
-    close = [value for value in tested if value[2] >= best_speed * (1 - tolerance)]
-    winner = min(close, key=lambda value: value[1])
+def choose_and_apply(cfg: dict[str, Any]) -> None:
+    cfg = validate_config(cfg)
+    log("Configuration validated; starting watchdog.")
+    if "fresh_top_n" in cfg or "close_result_percent" in cfg:
+        log("Legacy fresh_top_n/close_result_percent are ignored; top_n and the 50 ms window apply.")
+    client = Mihomo(cfg["controller"], cfg.get("secret", ""))
+    group = cfg["target_group"]
+    try:
+        node = current_node(client, group)
+        log(f"Current node in group {group}: {node}")
+        provider = resolve_provider(client, node)
+        if check_current(client, node, provider, {provider: client.provider(provider)},
+                         cfg["healthcheck_timeout_ms"]):
+            log("Current node is healthy. No switch is required.")
+            return
+    except Exception as exc:
+        log(f"Cannot confirm current node availability: {exc}")
 
+    nodes, data = target_candidates(client, group)
+    fallback = restore_service(client, cfg, nodes, data)
+    winner = None
+    if fallback:
+        historical = sorted((item for item in nodes if item["last_delay"] is not None),
+                            key=lambda item: (item["last_delay"], item["name"]))
+        shortlist = historical[:cfg["top_n"]]
+        log("Historical shortlist: " + (", ".join(
+            f"{item['name']} ({item['last_delay']} ms)" for item in shortlist) or "empty"))
+        if shortlist:
+            checked = check_candidates(client, cfg, shortlist, data)
+            if checked:
+                winner = benchmark_candidates(client, cfg, checked)
+    if winner is None:
+        log("No usable historical/fresh/speed result; starting one subscription recovery pass.")
+        # Refresh all providers, even those not used by the production selector.
+        try:
+            refresh(client, client.provider_names())
+        except RuntimeError as exc:
+            log(f"Provider refresh failed; checking existing provider data anyway: {exc}")
+        client._provider_cache.clear()
+        client._provider_names = None
+        nodes, data = target_candidates(client, group)
+        # Apply a fallback at the first positive fresh result, before waiting for
+        # the remaining checks or starting any throughput measurements.
+        checked = check_candidates(client, cfg, nodes, data, restore=True)
+        if not checked:
+            raise RuntimeError("No available eligible nodes after provider refresh and fresh healthchecks")
+        winner = benchmark_candidates(client, cfg, checked[:cfg["top_n"]])
+        if winner is None:
+            raise RuntimeError("Failed to measure speed after provider recovery; emergency fallback retained")
     client.select(group, winner[0])
-    log(
-        f"Selected winner: {winner[0]} — "
-        f"{winner[2]:.2f} Mbps, {winner[1]} ms."
-    )
+    log(f"Selected winner: {winner[0]} - {winner[2]:.2f} Mbps, {winner[1]} ms.")
 
 
 def sync_cron(entries: list[str]) -> bool:
@@ -821,51 +945,16 @@ def main() -> int:
     if any(value in {"-h", "--help"} for value in sys.argv[1:]):
         parser.print_help()
         return 0
+    parser.add_argument(
+        "--if-due", action="store_true",
+        help="with --clear-log, clear only after configured log_cleanup_days",
+    )
     args = parser.parse_args()
+    if args.if_due and not args.clear_log:
+        parser.error("--if-due requires --clear-log")
 
-    if args.clear_log:
-        try:
-            clear_log()
-            return 0
-        except OSError:
-            return 1
-
-    if args.remove_cron:
-        try:
-            changed = sync_cron([])
-            log(
-                "Removed router-watchdog cron entries."
-                if changed
-                else "No router-watchdog cron entries found."
-            )
-            return 0
-        except Exception as exc:
-            log(f"Failed to remove cron entries: {exc}")
-            return 1
-
-    if args.sync_cron:
-        if not CONFIG_PATH.exists():
-            log(f"Configuration file not found: {CONFIG_PATH}")
-            return 2
-        try:
-            with CONFIG_PATH.open(encoding="utf-8") as handle:
-                cfg = json.load(handle)
-            if not isinstance(cfg, dict):
-                raise ValueError("Configuration must be a JSON object")
-            entries = cron_entries(cfg.get("schedule", DEFAULT_SCHEDULE))
-            changed = sync_cron(entries)
-            if changed:
-                log(
-                    "Updated router-watchdog cron schedule."
-                    if entries
-                    else "Removed router-watchdog cron schedule."
-                )
-            return 0
-        except Exception as exc:
-            log(f"Failed to synchronize cron schedule: {exc}")
-            return 1
-
-    if not CONFIG_PATH.exists():
+    needs_config = args.sync_cron or args.if_due or not (args.clear_log or args.remove_cron)
+    if needs_config and not CONFIG_PATH.exists():
         log(f"Configuration file not found: {CONFIG_PATH}")
         return 2
     try:
@@ -877,19 +966,42 @@ def main() -> int:
     try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            log(f"Lock acquired: {LOCK_PATH}, PID={os.getpid()}")
         except BlockingIOError:
             log("Previous run is still in progress; skipping.")
             return 0
-        with CONFIG_PATH.open(encoding="utf-8") as handle:
-            cfg = json.load(handle)
-        if not isinstance(cfg, dict):
-            raise ValueError("Configuration must be a JSON object")
-
+        if not args.clear_log:
+            log(f"Lock acquired: {LOCK_PATH}, PID={os.getpid()}")
+        cfg: dict[str, Any] = {}
+        if needs_config:
+            with CONFIG_PATH.open(encoding="utf-8") as handle:
+                cfg = json.load(handle)
+            if not isinstance(cfg, dict):
+                raise ValueError("Configuration must be a JSON object")
+        if args.clear_log:
+            cleanup_log(cleanup_days(cfg) if args.if_due else None)
+            return 0
+        if args.remove_cron:
+            changed = sync_cron([])
+            log("Removed router-watchdog cron entries." if changed
+                else "No router-watchdog cron entries found.")
+            return 0
+        if args.sync_cron:
+            cleanup_days(cfg)
+            entries = cron_entries(cfg.get("schedule", DEFAULT_SCHEDULE))
+            changed = sync_cron(entries)
+            if changed:
+                log("Updated router-watchdog cron schedule.")
+            return 0
         choose_and_apply(cfg)
+        log("Watchdog completed successfully.")
         return 0
     except Exception as exc:
-        log(f"Error: {exc}")
+        if args.sync_cron:
+            log(f"Failed to synchronize cron schedule: {exc}")
+        elif args.remove_cron:
+            log(f"Failed to remove cron entries: {exc}")
+        else:
+            log(f"Error: {exc}")
         return 1
     finally:
         os.close(lock_fd)

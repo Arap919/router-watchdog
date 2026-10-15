@@ -1,0 +1,14 @@
+*.ipk
+*.tar.gz
+*.tar.xz
+*.tar.zst
+*.pyc
+__pycache__/
+.DS_Store
+
+feed/
+
+.env
+*.key
+credentials.json
+secrets/

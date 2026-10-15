@@ -243,9 +243,9 @@ class TestCronSchedule(unittest.TestCase):
         self.assertEqual(
             entries,
             [
-                "* 0,7-23 * * * root /opt/bin/flock -n /tmp/router_watchdog.lock /opt/bin/router-watchdog",
-                "0,30 1-6 * * * root /opt/bin/flock -n /tmp/router_watchdog.lock /opt/bin/router-watchdog",
-                "59 6 * * 0 root /opt/bin/router-watchdog --clear-log",
+                "* 0,7-23 * * * root /opt/bin/router-watchdog",
+                "0,30 1-6 * * * root /opt/bin/router-watchdog",
+                "59 6 * * * root /opt/bin/router-watchdog --clear-log --if-due",
             ],
         )
 
@@ -261,19 +261,19 @@ class TestCronSchedule(unittest.TestCase):
         self.assertEqual(
             entries,
             [
-                "0,5 0 * * * root /opt/bin/flock -n /tmp/router_watchdog.lock /opt/bin/router-watchdog",
-                "55 23 * * * root /opt/bin/flock -n /tmp/router_watchdog.lock /opt/bin/router-watchdog",
-                "59 6 * * 0 root /opt/bin/router-watchdog --clear-log",
+                "0,5 0 * * * root /opt/bin/router-watchdog",
+                "55 23 * * * root /opt/bin/router-watchdog",
+                "59 6 * * * root /opt/bin/router-watchdog --clear-log --if-due",
             ],
         )
 
     def test_empty_windows_disable_schedule(self):
         self.assertEqual(
             module.cron_entries({"windows": []}),
-            ["59 6 * * 0 root /opt/bin/router-watchdog --clear-log"],
+            ["59 6 * * * root /opt/bin/router-watchdog --clear-log --if-due"],
         )
 
-    def test_scheduled_watchdog_entries_use_nonblocking_flock(self):
+    def test_scheduled_watchdog_entries_use_internal_lock(self):
         entries = module.cron_entries(
             {
                 "windows": [
@@ -285,7 +285,7 @@ class TestCronSchedule(unittest.TestCase):
         self.assertTrue(entries)
         self.assertTrue(
             all(
-                " root /opt/bin/flock -n /tmp/router_watchdog.lock "
+                " root "
                 "/opt/bin/router-watchdog" in entry
                 for entry in entries
                 if "--clear-log" not in entry
@@ -302,8 +302,8 @@ class TestCronSchedule(unittest.TestCase):
                 }
             ),
             [
-                "* * * * * root /opt/bin/flock -n /tmp/router_watchdog.lock /opt/bin/router-watchdog",
-                "59 6 * * 0 root /opt/bin/router-watchdog --clear-log",
+                "* * * * * root /opt/bin/router-watchdog",
+                "59 6 * * * root /opt/bin/router-watchdog --clear-log --if-due",
             ],
         )
 
@@ -345,7 +345,7 @@ class TestCronSchedule(unittest.TestCase):
             crontab_path.write_text(
                 'MAILTO=""\n'
                 "*/1 * * * * root /opt/bin/run-parts /opt/etc/cron.1min\n"
-                "* 7-23 * * * root /opt/bin/flock -n /tmp/router_watchdog.lock "
+                "* 7-23 * * * root "
                 "/opt/bin/python3 /opt/libexec/router-watchdog/router_watchdog.py "
                 ">> /opt/share/router-watchdog.log 2>&1\n",
                 encoding="utf-8",
@@ -379,7 +379,7 @@ class TestCronSchedule(unittest.TestCase):
                 self.assertEqual(module.main(), 0)
 
             self.assertIn(
-                "0,30 1-6 * * * root /opt/bin/flock -n /tmp/router_watchdog.lock "
+                "0,30 1-6 * * * root "
                 "/opt/bin/router-watchdog",
                 crontab_path.read_text(encoding="utf-8"),
             )
@@ -473,7 +473,7 @@ class TestCronSchedule(unittest.TestCase):
             self.assertIn("Failed to synchronize cron schedule:", stdout.getvalue())
             self.assertIn("restart", stdout.getvalue())
 
-    def test_watchdog_lock_is_removed_after_run_and_skips_existing_lock(self):
+    def test_watchdog_uses_flock_and_keeps_lock_file(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = pathlib.Path(directory) / "config.json"
             lock_path = pathlib.Path(directory) / "router-watchdog.lock"
@@ -491,12 +491,15 @@ class TestCronSchedule(unittest.TestCase):
             ):
                 choose.side_effect = lambda _cfg: self.assertTrue(lock_path.exists())
                 self.assertEqual(module.main(), 0)
-                self.assertFalse(lock_path.exists())
+                self.assertTrue(lock_path.exists())
 
-                lock_path.touch()
+                with lock_path.open("w") as held_lock:
+                    module.fcntl.flock(held_lock, module.fcntl.LOCK_EX | module.fcntl.LOCK_NB)
+                    self.assertEqual(module.main(), 0)
+
                 self.assertEqual(module.main(), 0)
 
-            choose.assert_called_once_with({})
+            self.assertEqual(choose.call_args_list, [mock.call({}), mock.call({})])
             self.assertIn("Previous run is still in progress; skipping.", stdout.getvalue())
             self.assertIn(
                 "Previous run is still in progress; skipping.",

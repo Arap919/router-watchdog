@@ -1,181 +1,179 @@
 # router-watchdog
 
-A Mihomo failover watchdog packaged for Entware.
+Watchdog для Mihomo на Entware: проверяет текущую ноду, восстанавливает связь при её отказе и выбирает подходящую замену по свежему пингу и скорости. Замеры идут через отдельную скрытую группу и не переключают основную группу между кандидатами.
 
-The watchdog monitors the currently selected proxy in a Mihomo selector group.
-It always performs a fresh provider-owned healthcheck for the current node. If
-the current node fails, the watchdog refreshes the providers used by the target
-group, ranks candidates using the latest provider history latency, performs fresh
-healthchecks, benchmarks the best candidates through the local HTTP proxy, and
-selects the best result.
+[Документация проекта](docs/README.md) · [Структура проекта](docs/project-map.md) · [Алгоритм](docs/failover-design.md) · [План и статус](docs/implementation-plan.md)
 
+## Требования
 
-## Building the package
+- Entware, `/opt/bin/python3` и `ca-bundle`.
+- Mihomo с external controller API.
+- Основная группа типа `select` с конкретными нодами из proxy-providers.
+- Отдельная группа `BENCHMARK` с теми же нодами и HTTP listener для замеров.
+- Работающий Entware `crond`, читающий `/opt/etc/crontab`.
 
-The repository contains a standard Entware/OpenWrt package definition at
-`net/router-watchdog/Makefile`. Entware packages are built with the OpenWrt
-SDK/build system. The GitHub Actions workflow uses the official
-`Entware/docker` build environment, creates an `x64-3.2` build configuration,
-and compiles the package as an architecture-independent (`all`) package.
+Python-скрипт использует стандартную библиотеку. Пакет имеет архитектуру `all`; Python и сертификаты устанавливаются из feed архитектуры роутера.
 
-On every push to `main` and every pull request, the workflow builds and uploads
-the `.ipk` as a GitHub Actions artifact. When a tag matching `v*.*.*` is pushed,
-the same package is also attached to the corresponding GitHub Release.
+## Установка и обновление
 
-Create a release with:
+Добавьте feed пакета:
 
 ```sh
-git tag vX.Y.Z
-git push origin vX.Y.Z
+FEED='src/gz router-watchdog https://arap919.github.io/router-watchdog/all'
+grep -qF "$FEED" /opt/etc/opkg.conf || echo "$FEED" >> /opt/etc/opkg.conf
+opkg update
+opkg install router-watchdog
 ```
 
-The resulting package is attached to the GitHub Release. For example, release
-`v1.0.2` provides:
+На Keenetic с MIPSel встроенный downloader иногда не поддерживает HTTPS и сообщает `wget: not an http or ftp url: https://...`. Сначала установите Entware `wget-ssl` из штатного feed:
 
 ```sh
-wget -O /tmp/router-watchdog_1.0.2-1_all.ipk \
-  https://github.com/Arap919/router-watchdog/releases/download/v1.0.2/router-watchdog_1.0.2-1_all.ipk
-opkg install /tmp/router-watchdog_1.0.2-1_all.ipk
+opkg update
+opkg install wget-ssl
+opkg update
+opkg install router-watchdog
 ```
 
-The package itself contains only Python and shell files, so it is architecture
-independent. Its runtime dependencies (`python3` and `ca-bundle`) are resolved
-by `opkg` for the target Entware architecture.
-
-## Entware feed
-
-Tagged releases are published as a static Entware feed through GitHub Pages. The
-feed contains the architecture-independent `router-watchdog` package under
-`all/`, together with `Packages` and `Packages.gz` metadata.
-
-After the first tagged release, configure an Entware device with the feed URL
-shown by the GitHub Pages deployment. For a repository named
-`OWNER/router-watchdog`, the expected feed URL is:
-
-```text
-https://OWNER.github.io/router-watchdog/all
-```
-
-Add the feed on the router as described in [Installation](#installation). The
-feed index stores the package filename relative to this `/all` directory; the
-correct package URL has one `all` path component, not `/all/all/`.
-
-To upgrade an installed package:
+Обновление установленного пакета:
 
 ```sh
 opkg update
 opkg upgrade router-watchdog
 ```
 
-The package is declared as `Architecture: all`, so the same feed entry can be
-used on supported Entware architectures. The runtime dependencies (`python3`
-and `ca-bundle`) are resolved from the normal Entware feeds.
+Если старый индекс содержит путь `/all/all/`, обновите индекс через `opkg update`: адрес пакета должен содержать только один компонент `/all/`.
 
-The feed is published only for version tags (`vX.Y.Z`). The workflow verifies
-that the tag version matches `PKG_VERSION` in the package Makefile. Pull requests
-and normal `main` pushes still build and validate the package, but do not change
-the public feed.
+Пользовательский JSON зарегистрирован как conffile и сохраняется при обновлении. После перехода с прежней версии подготовьте benchmark listener, замените в JSON `benchmark_proxy` и добавьте `benchmark_group`; затем синхронизируйте cron.
 
-## Requirements
+## Настройка Mihomo
 
-- Entware with Python 3 available as `/opt/bin/python3`.
-- Mihomo with its external controller API enabled.
-- A selector group containing provider-backed concrete proxy nodes.
-- A local HTTP proxy used for speed tests, normally Mihomo's mixed/http proxy.
+Файл `myMihomoCongif.yml` — личный пример конфигурации, он не устанавливается пакетом. В нём `ПОДПИСКА PAPER` стоит первой в `proxy-groups` и в явном порядке встроенной `GLOBAL`. Имена существующих групп сохранены, чтобы правила продолжали ссылаться на них. Повторяющиеся списки нод оформлены YAML-якорем; состояния селекторов при этом независимы.
 
-The package is architecture-independent because it contains Python and shell
-code only.
+В исходном файле есть несоответствие `MATCH,Other` и имени группы `other`; правило оставлено без изменения. Нативная проверка Mihomo на этом компьютере недоступна, поэтому перед применением нужно отдельно устранить эту ссылку и проверить конфиг на роутере.
 
-## Installation
+Добавьте фрагменты в соответствующие секции своего конфига:
 
-### Other Entware architectures
+```yaml
+listeners:
+  - name: benchmark-in
+    type: http
+    port: 17890
+    listen: 127.0.0.1
+    proxy: BENCHMARK
+    users: []
 
-On Entware architectures where the configured `opkg` downloader already
-supports HTTPS, add the feed and install the package:
+proxy-groups:
+  - name: BENCHMARK
+    type: select
+    use:
+      - Paper
+      - Paper-запасной-ключ
+    hidden: true
+```
+
+Listener направляет запросы непосредственно в `BENCHMARK`. У этой группы должны быть доступны все ноды, которые watchdog может выбирать в основной группе. Основная и benchmark-группа должны различаться. Применение Mihomo-конфига на роутере выполняется отдельно.
+
+## Конфигурация watchdog
+
+Отредактируйте `/opt/etc/router-watchdog.json`:
+
+```json
+{
+  "controller": "http://127.0.0.1:9090",
+  "secret": "",
+  "target_group": "ПОДПИСКА PAPER",
+  "benchmark_group": "BENCHMARK",
+  "benchmark_proxy": "http://127.0.0.1:17890",
+  "top_n": 7,
+  "healthcheck_parallelism": 6,
+  "healthcheck_timeout_ms": 5000,
+  "speed_connect_timeout_seconds": 5,
+  "switch_wait_seconds": 0.7,
+  "download_bytes": 25000000,
+  "parallel_streams": 4,
+  "multi_rounds": 2,
+  "log_cleanup_days": 3,
+  "schedule": {
+    "windows": [
+      {"start": "07:00", "end": "01:00", "every_minutes": 1},
+      {"start": "01:00", "end": "07:00", "every_minutes": 30}
+    ]
+  }
+}
+```
+
+В пакетном JSON `target_group` намеренно пуст: укажите свою основную группу. API secret храните локально в конфигурации; watchdog отправляет его как Bearer token. Не добавляйте личные subscription URL или секреты в публичные материалы.
+
+| Параметр | Значение и ограничения |
+| --- | --- |
+| `controller` | HTTP(S)-адрес API Mihomo; обязателен, без credentials в URL. |
+| `secret` | Строка, по умолчанию пустая. |
+| `target_group` | Имя основной группы `select`; обязательно. |
+| `benchmark_group` | Отдельная группа `select`; по умолчанию `BENCHMARK`. |
+| `benchmark_proxy` | HTTP(S)-адрес выделенного listener; по умолчанию `http://127.0.0.1:17890`. |
+| `top_n` | Число кандидатов по последнему delay, `1..50`, по умолчанию `7`. Все ответившие кандидаты этого списка измеряются. |
+| `healthcheck_parallelism` | Параллельные проверки кандидатов, `1..32`, по умолчанию `6`. Первичный поиск аварийной ноды последовательный, до первого успеха. |
+| `healthcheck_timeout_ms` | Таймаут свежей проверки, `250..10000` мс, по умолчанию `5000`. |
+| `speed_connect_timeout_seconds` | Таймаут соединения и ожидания данных потока, `1..30` секунд, по умолчанию `5`. |
+| `switch_wait_seconds` | Пауза после выбора в `BENCHMARK`; конечное неотрицательное число, по умолчанию `0.7`. |
+| `download_bytes` | Объём запроса каждого потока, `1000000..200000000` байт, по умолчанию `25000000`. |
+| `parallel_streams` | Потоки в раунде, `1..8`, по умолчанию `4`. |
+| `multi_rounds` | Раунды для каждой ноды, `1..4`, по умолчанию `2`; скорость — медиана раундов. |
+| `log_cleanup_days` | Интервал очистки лога, `1..3650` дней, по умолчанию `3`. |
+| `schedule.windows` | Суточные окна запуска в локальном времени роутера. |
+
+Настройки замеров могут создавать существенный тестовый трафик: при базовых значениях успешный кандидат использует около `25 MB × 4 потока × 2 раунда = 200 MB`. Скачивание идёт с Cloudflare Speed Test.
+
+Прежние `fresh_top_n` и `close_result_percent` принимаются для совместимости старых JSON, но игнорируются с записью в лог. Больше нет дополнительного сокращения shortlist или выбора по проценту близости скоростей.
+
+## Алгоритм
+
+1. Проверить JSON и взять неблокирующую блокировку `/tmp/router_watchdog.lock`. При занятой блокировке записать пропуск и выйти.
+2. Выполнить свежий healthcheck текущей ноды с настройками её провайдера. Если она доступна — завершить работу.
+3. Получить конкретные provider-backed ноды из `target_group`, исключая названия с `Россия` или `Украина` без учёта регистра. Ноды того же провайдера вне группы не участвуют.
+4. До замеров свежими проверками найти первую рабочую ноду и немедленно включить её в основной группе. Устаревший нулевой delay не запрещает аварийную проверку.
+5. По последнему положительному историческому delay взять `top_n`, свежими проверками подтвердить доступность и измерить скорость всех ответивших через `BENCHMARK`.
+6. Если нет истории, все shortlisted healthchecks или все speed tests неудачны либо аварийную ноду найти не удалось — один раз обновить все proxy-providers, заново прочитать состав группы и свежими проверками проверить её допустимые ноды. Первую рабочую сразу включить в основной группе; затем взять `top_n` по свежей задержке и выполнить замеры.
+7. Среди успешно измеренных нод найти минимальный свежий пинг. В диапазоне от него до `+50 мс` включительно выбрать максимальную скорость; при равной скорости — меньший пинг.
+8. После всех замеров включить победителя в основной группе.
+
+Если после восстановления подписок рабочих нод нет, watchdog завершится с ошибкой и записью в лог. Если рабочая аварийная нода есть, но все повторные замеры скорости провалились, она остаётся выбранной, а watchdog сообщает ошибку измерений. Частичный провал обновления провайдеров логируется; доступные ноды всё равно проверяются. При отказе API переключения нельзя считать связь восстановленной.
+
+Healthcheck использует `/providers/proxies/{provider}/{node}/healthcheck`, провайдерские `testUrl` и `expectedStatus`. Старые `alive` и история не подтверждают доступность текущей ноды. У истории учитывается только последняя запись: `delay: 0` не заменяется более ранним успехом.
+
+## Команды, лог и блокировка
 
 ```sh
-FEED='src/gz router-watchdog https://arap919.github.io/router-watchdog/all'
-grep -qF "$FEED" /opt/etc/opkg.conf || echo "$FEED" >> /opt/etc/opkg.conf
+/opt/bin/router-watchdog                 # обычная проверка
+/opt/bin/router-watchdog --help
+/opt/bin/router-watchdog --sync-cron
+/opt/bin/router-watchdog --remove-cron
+/opt/bin/router-watchdog --clear-log      # немедленная очистка
+/opt/bin/router-watchdog --clear-log --if-due  # очистка по сроку
 
-opkg update
-opkg install router-watchdog
+tail -f /opt/share/router-watchdog.log
 ```
 
-If `opkg update` reports `wget: not an http or ftp url: https://...`, follow
-the [MIPSel HTTPS downloader instructions](#keenetic-with-mipsel-entware) to
-install Entware's `wget-ssl`, then retry `opkg update`.
+Лог содержит время, этапы проверки, результаты healthcheck и раундов замера, обновления провайдеров, аварийный выбор и победителя. Сообщения также выводятся в stdout; cron не перенаправляет их повторно в тот же файл. Тела HTTP-ошибок контроллера не выводятся: они могут содержать приватные subscription URL.
 
-### Keenetic with MIPSel Entware
+Все действия, кроме справки, используют общую `fcntl.flock` блокировку. Файл блокировки не удаляется; дескриптор закрывается при завершении, в том числе при ошибке. Коды выхода: `0` — успех или пропуск занятого запуска; `1` — ошибка; `2` — отсутствующий обязательный конфиг.
 
-The package is architecture-independent (`Architecture: all`), but its
-dependencies must still be available for the router's Entware architecture.
-For example, Keenetic systems using the `mipselsf-k3.4` feed resolve Python 3,
-CA certificates, and the HTTPS downloader from that architecture's Entware
-feeds.
+Очистка проверяется cron ежедневно в 06:59. Срок хранится в `/opt/share/router-watchdog.log.cleanup`: при первой проверке начинается отсчёт без очистки существующего лога; после трёх прошедших суток следующая ежедневная проверка очищает лог. Ручная очистка сбрасывает срок. Неуспешная очистка не обновляет timestamp. Повреждённый timestamp вызывает ошибку, а не удаление лога. Пропущенный из-за блокировки ежедневный запуск повторится на следующий день.
 
-The default Entware `wget` on this MIPSel setup may not support HTTPS. If
-`opkg update` reports:
+## Cron и пути
 
-```text
-wget: not an http or ftp url: https://...
-```
-
-first update the Entware feeds and install its HTTPS-capable downloader. The
-Entware repository URL uses HTTP, so this step does not require HTTPS support:
-
-```sh
-opkg update
-opkg install wget-ssl
-```
-
-If the router-watchdog feed was already configured, this first `opkg update`
-may still report the HTTPS download error for that feed. The Entware HTTP
-indexes are updated independently, so continue with `opkg install wget-ssl`.
-
-Then add the router-watchdog feed and install the package:
-
-```sh
-FEED='src/gz router-watchdog https://arap919.github.io/router-watchdog/all'
-grep -qF "$FEED" /opt/etc/opkg.conf || echo "$FEED" >> /opt/etc/opkg.conf
-
-opkg update
-opkg install router-watchdog
-```
-
-If `opkg` tries to fetch a URL containing
-`/router-watchdog/all/all/router-watchdog_...ipk`, refresh the package index:
-an earlier feed index had an extra `all/` prefix in `Filename`. The published
-index has been corrected; after `opkg update`, the package URL should contain
-only one `/all/`.
-
-The watchdog package is architecture-independent, while `wget-ssl`, Python 3,
-and other runtime dependencies are installed as matching MIPSel packages by
-Entware.
-
-### After installation
-
-These steps apply to all supported Entware architectures. Edit the
-configuration and apply its cron schedule:
+`schedule.windows` задаёт `start`, `end` в формате `HH:MM` и целый `every_minutes` от `1` до `1440`. Начало включено, конец исключён; окна могут пересекать полночь. Совпадающие начало и конец означают сутки. Перекрывающиеся окна объединяются; пустой список отключает проверки нод, но сохраняет ежедневную задачу очистки.
 
 ```sh
 vi /opt/etc/router-watchdog.json
 /opt/bin/router-watchdog --sync-cron
 ```
 
-Set at least `target_group` to the name of a Mihomo selector group. The full
-configuration example and schedule options are documented below. Ensure
-Entware's `crond` is running and reads `/opt/etc/crontab`; otherwise the
-scheduled watchdog runs will not execute.
+Хук `/opt/etc/cron.1min/router-watchdog` синхронизирует настройки обычно в течение минуты. Предполагается, что Entware уже запускает `run-parts` для этого каталога. Синхронизация меняет только помеченные записи `/opt/etc/crontab` и перезапускает `/opt/etc/init.d/S10cron`, когда расписание изменилось. Записи содержат поле пользователя `root`.
 
-Execution logs are appended to `/opt/share/router-watchdog.log`. The managed
-crontab also truncates this file every Sunday at 06:59 router-local time. To
-inspect the log:
+Старые записи watchdog удаляются из `/opt/var/spool/cron/crontabs/root` и `/opt/etc/crontabs/root`, несвязанные задачи сохраняются. `crontab -l` показывает пользовательский spool, а не системный `/opt/etc/crontab`.
 
-```sh
-tail -f /opt/share/router-watchdog.log
-```
-
-The package installs:
+Пакет устанавливает:
 
 ```text
 /opt/bin/router-watchdog
@@ -184,403 +182,24 @@ The package installs:
 /opt/etc/cron.1min/router-watchdog
 ```
 
-The package synchronizes its managed entries in `/opt/etc/crontab`, the
-system-wide Entware crontab format used by this installation. Each generated
-entry includes the `root` user field. This differs from `crontab -l`, which
-reads the per-user spool file `/opt/var/spool/cron/crontabs/root` and uses
-five-field entries without a username. The package removes its old managed
-entries from the per-user spool and `/opt/etc/crontabs/root` while preserving
-unrelated jobs.
+## Разработка и сборка
 
-When synchronization changes the system crontab, the package restarts
-`/opt/etc/init.d/S10cron`; an unchanged schedule does not restart the service.
-The one-minute `cron.1min` hook runs `--sync-cron`, so configuration schedule
-changes are applied automatically.
-
-The configuration file is registered as a package conffile, so package
-upgrades do not silently replace a modified `/opt/etc/router-watchdog.json`.
-
-## Manual run
+Локальные проверки из корня проекта:
 
 ```sh
-/opt/bin/router-watchdog
+python3 -m unittest discover -s tests -v
+python3 -m py_compile net/router-watchdog/files/opt/libexec/router-watchdog/router_watchdog.py
+sh -n net/router-watchdog/files/opt/bin/router-watchdog
+sh -n net/router-watchdog/files/opt/etc/cron.1min/router-watchdog
+git diff --check
 ```
 
-Scheduled watchdog runs prevent overlap with Entware `flock` using:
+Тесты подменяют сетевые операции; проверка роутера и сборка IPK выполняются отдельно. `net/router-watchdog/test.sh` предназначен для установленного пакета.
 
-```text
-/opt/bin/flock -n /tmp/router_watchdog.lock
-```
+Определение пакета находится в `net/router-watchdog/Makefile`. GitHub Actions использует Entware Docker/OpenWrt build environment с конфигурацией `x64-3.2`. Push в main и PR собирают IPK как artifact; теги `v*.*.*` дополнительно публикуют release и статический feed через GitHub Pages. Версия тега должна совпадать с `PKG_VERSION`. Эти внешние действия выполняются только после отдельного решения о выпуске.
 
-The script also creates an exclusive lock file next to its Python source before
-starting work and removes it in `finally`. This second guard prevents a manual
-run or another invocation that bypasses cron's `flock` from overlapping; a
-skipped invocation is recorded in the log. The cron lock covers scheduled
-commands, while the script lock covers every entry point.
+Для моделей ИИ точка входа — [AGENTS.md](AGENTS.md) и [проектный скилл](.agents/skills/router-watchdog-context/SKILL.md).
 
-Both manual and scheduled runs append to `/opt/share/router-watchdog.log`.
-Messages are also printed to stdout. Cron commands do not redirect stdout to
-the same file, avoiding duplicate log lines.
-
-## Configuration
-
-Configuration file:
-
-```text
-/opt/etc/router-watchdog.json
-```
-
-Change the configuration
-```text
-vi /opt/etc/router-watchdog.json
-```
-
-You can also prepare the file elsewhere and copy it to the router.
-
-Example:
-
-```json
-{
-  "controller": "http://127.0.0.1:9090",
-  "secret": "",
-  "target_group": "MY_SELECTOR_GROUP",
-  "benchmark_proxy": "http://127.0.0.1:7890",
-  "top_n": 7,
-  "fresh_top_n": 7,
-  "healthcheck_parallelism": 6,
-  "healthcheck_timeout_ms": 5000,
-  "speed_connect_timeout_seconds": 5,
-  "switch_wait_seconds": 0.7,
-  "download_bytes": 25000000,
-  "parallel_streams": 4,
-  "multi_rounds": 2,
-  "close_result_percent": 10,
-  "schedule": {
-    "windows": [
-      {
-        "start": "07:00",
-        "end": "01:00",
-        "every_minutes": 1
-      },
-      {
-        "start": "01:00",
-        "end": "07:00",
-        "every_minutes": 30
-      }
-    ]
-  }
-}
-```
-
-### `schedule`
-
-**Type:** object
-**Required:** no; defaults to the package's current schedule for existing configs
-
-`schedule.windows` contains daily time windows. Each window has `start` and
-`end` in the router's local time (`HH:MM`) and an `every_minutes` interval from
-1 to 1440. The start is included and the end is excluded; windows may cross
-midnight. Matching start and end times mean a full-day window. Overlapping
-windows are combined. An empty `windows` array disables scheduled runs.
-
-For example, to run every five minutes from 07:00 until 01:00 and every
-30 minutes overnight:
-
-```json
-"schedule": {
-  "windows": [
-    { "start": "07:00", "end": "01:00", "every_minutes": 5 },
-    { "start": "01:00", "end": "07:00", "every_minutes": 30 }
-  ]
-}
-```
-
-The package writes only its marked block in `/opt/etc/crontab`; other crontab
-entries are left unchanged.
-The package's `cron.1min` hook synchronizes the managed entries after a
-configuration edit, normally within one minute. When the generated schedule
-changes, synchronization restarts the Entware cron service so the new schedule
-is applied immediately.
-To apply the schedule immediately after editing the JSON, run:
-
-```sh
-/opt/bin/router-watchdog --sync-cron
-```
-
-### `controller`
-
-**Type:** string  
-**Required:** yes
-
-Base URL of the Mihomo external controller API.
-
-Example:
-
-```json
-"controller": "http://127.0.0.1:9090"
-```
-
-The value must use `http://` or `https://` and include a host.
-
-### `secret`
-
-**Type:** string  
-**Required:** no  
-**Default:** `""`
-
-Mihomo controller API secret.
-
-When non-empty, the watchdog sends it as a Bearer token:
-
-```text
-Authorization: Bearer <secret>
-```
-
-Leave it empty when the controller does not require authentication.
-
-### `target_group`
-
-**Type:** string  
-**Required:** yes
-
-Name of the Mihomo selector group that the watchdog controls.
-
-The watchdog reads the currently selected node from this group and changes the
-selection only when the current node fails the fresh healthcheck.
-
-The package does **not** have a separate `providers` configuration field.
-Provider names are discovered automatically from the concrete nodes exposed by
-`target_group`. This means that adding another provider to the selector group
-does not require changing the watchdog configuration.
-
-### `benchmark_proxy`
-
-**Type:** string  
-**Required:** yes
-
-Local HTTP proxy used for throughput measurements.
-
-Example:
-
-```json
-"benchmark_proxy": "http://127.0.0.1:7890"
-```
-
-Each speed test downloads data through this proxy after the candidate node has
-been selected in `target_group`.
-
-### `top_n`
-
-**Type:** integer  
-**Range:** `1..50`  
-**Default:** `7`
-
-Number of candidates taken from the historical ranking before fresh
-healthchecks.
-
-Historical ranking uses exactly the latest `history.delay` entry reported by
-the provider. A latest delay of `0` is treated as a failed check and is not
-interpreted as zero milliseconds.
-
-### `fresh_top_n`
-
-**Type:** integer  
-**Range:** `1..30`  
-**Default:** `7`
-
-Number of candidates that remain after the fresh healthcheck and are sent to
-the speed-test stage.
-
-This is separate from `top_n`:
-
-```text
-all provider nodes
-      ↓
-latest history ranking
-      ↓
-top_n
-      ↓
-fresh healthcheck
-      ↓
-fresh latency ranking
-      ↓
-fresh_top_n
-      ↓
-speed test
-```
-
-### `healthcheck_parallelism`
-
-**Type:** integer  
-**Range:** `1..32`  
-**Default:** `6`
-
-Maximum number of fresh provider healthchecks performed concurrently.
-
-A higher value can reduce the total healthcheck time but creates more
-simultaneous requests to the Mihomo controller and provider infrastructure.
-
-### `healthcheck_timeout_ms`
-
-**Type:** integer  
-**Range:** `250..10000`  
-**Default:** `5000`
-
-Timeout for each provider-owned fresh healthcheck, in milliseconds.
-
-The healthcheck uses the provider's own `testUrl` and `expectedStatus` values.
-The watchdog does not replace those values with a global URL or status code.
-
-### `speed_connect_timeout_seconds`
-
-**Type:** integer  
-**Range:** `1..30`  
-**Default:** `5`
-
-Connection timeout for each speed-test download, in seconds.
-
-The speed test uses the configured `benchmark_proxy` and downloads from
-Cloudflare Speed Test.
-
-### `switch_wait_seconds`
-
-**Type:** number  
-**Default:** `0.7`
-
-Delay after selecting a candidate and before starting its speed test.
-
-This gives Mihomo time to apply the new selector state and establish the
-selected route.
-
-Example:
-
-```json
-"switch_wait_seconds": 0.7
-```
-
-### `download_bytes`
-
-**Type:** integer  
-**Range:** `1,000,000..200,000,000`  
-**Default:** `25,000,000`
-
-Amount of data requested by each speed-test stream, in bytes.
-
-Larger values make the measurement less sensitive to short-lived fluctuations
-but increase test duration and traffic consumption.
-
-### `parallel_streams`
-
-**Type:** integer  
-**Range:** `1..8`  
-**Default:** `4`
-
-Number of simultaneous HTTP download streams used during each speed-test
-round.
-
-The total amount downloaded in one round is approximately:
-
-```text
-parallel_streams × download_bytes
-```
-
-### `multi_rounds`
-
-**Type:** integer  
-**Range:** `1..4`  
-**Default:** `2`
-
-Number of speed-test rounds performed for each finalist.
-
-The watchdog calculates the median throughput across all rounds, which reduces
-the influence of one unusually slow or fast measurement.
-
-### `close_result_percent`
-
-**Type:** integer  
-**Range:** `0..50`  
-**Default:** `10`
-
-Defines how close two speed-test results must be before latency becomes the
-tie-breaker.
-
-The fastest candidate is selected first. Other candidates whose speed is within
-this percentage of the fastest result form the close-results set. The candidate
-with the lowest fresh healthcheck latency wins within that set.
-
-Example with `10`:
-
-```text
-Fastest candidate: 100 Mbps
-Close-results threshold: 90 Mbps
-
-100 Mbps, 80 ms  -> eligible
-95 Mbps, 50 ms   -> eligible and can win
-85 Mbps, 30 ms   -> not eligible
-```
-
-## Provider configuration
-
-Provider names are intentionally not stored in `router-watchdog.json`.
-
-For each provider discovered from `target_group`, the watchdog reads:
-
-- `testUrl` — URL used by the provider healthcheck.
-- `expectedStatus` — expected HTTP status, when provided.
-- `proxies` — concrete nodes belonging to the provider.
-- each node's `history` — used to obtain the latest historical latency.
-
-The current node is always checked using the provider-owned endpoint:
-
-```text
-GET /providers/proxies/{provider}/{proxyName}/healthcheck
-```
-
-The watchdog does not use stale `alive` or `history` data to decide whether the
-currently selected node is healthy.
-
-## Failover algorithm
-
-1. Read the current node from `target_group`.
-2. Resolve its provider.
-3. Read the provider's current healthcheck configuration.
-4. Perform a fresh healthcheck of the current node.
-5. If it succeeds, stop without changing the selector.
-6. If it fails, discover all providers used by `target_group`.
-7. Refresh those providers.
-8. Collect all concrete nodes and their latest provider history.
-9. Take the best `top_n` historical candidates.
-10. Fresh-check those candidates concurrently.
-11. If three or more candidates fail the fresh healthcheck, fresh-check all
-    concrete nodes.
-12. Keep the best `fresh_top_n` candidates by fresh latency.
-13. Speed-test each finalist sequentially by selecting it in `target_group` and
-    downloading through `benchmark_proxy`.
-14. Select the fastest candidate.
-15. If several results are within `close_result_percent` of the best speed,
-    select the one with the lowest fresh latency.
-
-## Cron
-
-The package keeps using the existing Entware/Keenetic `cron.1min` hook, but it
-uses that hook only to synchronize the configured schedule. Actual watchdog
-runs are entries in `/opt/etc/crontab`, generated from `schedule.windows` in
-system-crontab format with a `root` user field. Entware `crond` must be enabled
-and configured to read this file.
-
-The hook is:
-
-```text
-/opt/etc/cron.1min/router-watchdog
-```
-
-It is expected that Entware already runs `run-parts` for this directory every
-minute. Package installation creates the initial crontab entries, and later
-configuration edits are synchronized by the hook. Removing the package removes
-its managed entries and legacy watchdog commands from the cron files. A
-separate managed cron entry clears `/opt/share/router-watchdog.log` every
-Sunday at 06:59 router-local time.
-
-## License
+## Лицензия
 
 MIT

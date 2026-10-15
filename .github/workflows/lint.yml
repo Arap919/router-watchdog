@@ -21,13 +21,12 @@ jobs:
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -v
 
-      - name: Check for Cyrillic in source and documentation
+      - name: Check for Cyrillic in technical source
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
           files = [
-              Path('README.md'),
               Path('net/router-watchdog/files/opt/libexec/router-watchdog/router_watchdog.py'),
           ]
           for path in files:
@@ -44,11 +43,11 @@ jobs:
 
           config = json.loads(Path('net/router-watchdog/files/opt/etc/router-watchdog.json').read_text())
           expected = {
-              'controller', 'secret', 'target_group', 'benchmark_proxy',
-              'top_n', 'fresh_top_n', 'healthcheck_parallelism',
+              'controller', 'secret', 'target_group', 'benchmark_group', 'benchmark_proxy',
+              'top_n', 'healthcheck_parallelism',
               'healthcheck_timeout_ms', 'speed_connect_timeout_seconds',
               'switch_wait_seconds', 'download_bytes', 'parallel_streams',
-              'multi_rounds', 'close_result_percent', 'schedule',
+              'multi_rounds', 'log_cleanup_days', 'schedule',
           }
           actual = set(config)
           if actual != expected:

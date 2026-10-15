@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_CONFIG", "/opt/etc/router-watchdog.json"))
 LOG_PATH = Path(os.environ.get("ROUTER_WATCHDOG_LOG", "/opt/share/router-watchdog.log"))
 LOCK_PATH = Path("/tmp/router_watchdog.lock")
+MIHOMO_CONFIG_PATH = Path("/opt/etc/mihomo/config.yaml")
 DEFAULT_CRONTAB_PATH = Path("/opt/etc/crontab")
 LEGACY_CRONTAB_PATH = Path("/opt/var/spool/cron/crontabs/root")
 OLD_LEGACY_CRONTAB_PATH = Path("/opt/etc/crontabs/root")
@@ -743,8 +744,39 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def configured_providers(group: str) -> list[str]:
+    """Read the target selector's explicit provider references, never subscriptions."""
+    try:
+        import yaml
+    except ImportError:
+        raise RuntimeError("YAML support is missing; install python3-yaml") from None
+    try:
+        with MIHOMO_CONFIG_PATH.open(encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+    except yaml.YAMLError:
+        # Parser diagnostics can contain private subscription URLs.
+        raise RuntimeError(f"Invalid YAML in {MIHOMO_CONFIG_PATH}") from None
+    if not isinstance(config, dict):
+        raise RuntimeError("Mihomo configuration must be a mapping")
+    groups = config.get("proxy-groups")
+    definitions = config.get("proxy-providers")
+    if not isinstance(groups, list) or not isinstance(definitions, dict):
+        raise RuntimeError("Mihomo configuration requires proxy-groups and proxy-providers")
+    matches = [item for item in groups if isinstance(item, dict) and item.get("name") == group]
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected exactly one target_group {group!r} in Mihomo YAML")
+    providers = matches[0].get("use")
+    if (not isinstance(providers, list) or not providers
+            or any(not isinstance(name, str) or not name for name in providers)):
+        raise RuntimeError(f"target_group {group!r} requires a nonempty use list")
+    if any(name not in definitions or not isinstance(definitions[name], dict)
+           for name in providers):
+        raise RuntimeError("Every target_group use entry must exist in proxy-providers")
+    return list(dict.fromkeys(providers))
+
+
 def target_candidates(
-    client: Mihomo, group: str,
+    client: Mihomo, group: str, providers: list[str],
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     value = client.proxy_group(group)
     if value.get("type") != "Selector":
@@ -765,7 +797,7 @@ def target_candidates(
     wanted = set(allowed)
     found: dict[str, dict[str, Any]] = {}
     data_map: dict[str, dict[str, Any]] = {}
-    for provider in client.provider_names():
+    for provider in providers:
         try:
             data = client.provider(provider)
             items = [item for item in provider_nodes(data, provider) if item["name"] in wanted]
@@ -862,10 +894,23 @@ def choose_and_apply(cfg: dict[str, Any]) -> None:
         log("Legacy fresh_top_n/close_result_percent are ignored; top_n and the 50 ms window apply.")
     client = Mihomo(cfg["controller"], cfg.get("secret", ""))
     group = cfg["target_group"]
+    providers = configured_providers(group)
+    log(f"Providers from target_group {group}: {', '.join(providers)}")
     try:
         node = current_node(client, group)
         log(f"Current node in group {group}: {node}")
-        provider = resolve_provider(client, node)
+        provider = None
+        for name in providers:
+            try:
+                items = provider_nodes(client.provider(name), name)
+            except Exception as exc:
+                log(f"Cannot read current-node provider {name}: {exc}")
+                continue
+            if any(item["name"] == node for item in items):
+                provider = name
+                break
+        if provider is None:
+            raise RuntimeError("Current node not found in target_group providers")
         if check_current(client, node, provider, {provider: client.provider(provider)},
                          cfg["healthcheck_timeout_ms"]):
             log("Current node is healthy. No switch is required.")
@@ -873,7 +918,7 @@ def choose_and_apply(cfg: dict[str, Any]) -> None:
     except Exception as exc:
         log(f"Cannot confirm current node availability: {exc}")
 
-    nodes, data = target_candidates(client, group)
+    nodes, data = target_candidates(client, group, providers)
     fallback = restore_service(client, cfg, nodes, data)
     winner = None
     if fallback:
@@ -888,14 +933,13 @@ def choose_and_apply(cfg: dict[str, Any]) -> None:
                 winner = benchmark_candidates(client, cfg, checked)
     if winner is None:
         log("No usable historical/fresh/speed result; starting one subscription recovery pass.")
-        # Refresh all providers, even those not used by the production selector.
+        # Refresh only providers explicitly used by the production selector.
         try:
-            refresh(client, client.provider_names())
+            refresh(client, providers)
         except RuntimeError as exc:
             log(f"Provider refresh failed; checking existing provider data anyway: {exc}")
         client._provider_cache.clear()
-        client._provider_names = None
-        nodes, data = target_candidates(client, group)
+        nodes, data = target_candidates(client, group, providers)
         # Apply a fallback at the first positive fresh result, before waiting for
         # the remaining checks or starting any throughput measurements.
         checked = check_candidates(client, cfg, nodes, data, restore=True)

@@ -13,7 +13,7 @@ define Package/router-watchdog
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Mihomo provider failover watchdog
-  DEPENDS:=+python3 +ca-bundle
+  DEPENDS:=+python3 +python3-yaml +ca-bundle
   PKGARCH:=all
 endef
 

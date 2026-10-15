@@ -77,6 +77,12 @@ class TestFailover(unittest.TestCase):
                     'parallel_streams': 1, 'multi_rounds': 1,
                     'healthcheck_parallelism': 1}
         self.log = mock.patch.object(module, 'log').start()
+        self.mihomo_config = tempfile.TemporaryDirectory()
+        self.addCleanup(self.mihomo_config.cleanup)
+        path = pathlib.Path(self.mihomo_config.name) / 'config.yaml'
+        path.write_text('proxy-groups:\n  - name: main\n    use: [Paper]\n'
+                        'proxy-providers:\n  Paper: {type: http}\n')
+        mock.patch.object(module, 'MIHOMO_CONFIG_PATH', path, create=True).start()
         self.addCleanup(mock.patch.stopall)
 
     def run_watchdog(self, client, speeds=None):
@@ -123,13 +129,62 @@ class TestFailover(unittest.TestCase):
         self.assertNotIn('Россия 1', checked)
         self.assertNotIn('Украина 1', checked)
 
-    def test_zero_history_restores_service_then_refreshes_all_providers(self):
+    def test_no_unrelated_provider_discovery_or_reads(self):
+        client = Controller({'dead': 0, 'a': 25}, histories={'dead': 0, 'a': 0})
+        original = client.provider
+        with (mock.patch.object(client, 'provider_names', side_effect=AssertionError('global discovery')),
+              mock.patch.object(client, 'proxy', side_effect=AssertionError('unscoped lookup')),
+              mock.patch.object(client, 'provider', side_effect=original) as read):
+            self.run_watchdog(client)
+        self.assertEqual({call.args[0] for call in read.call_args_list}, {'Paper'})
+        self.assertNotIn(('refresh', 'unused'), client.events)
+
+    def test_unreadable_first_provider_does_not_skip_healthy_current_node(self):
+        path = module.MIHOMO_CONFIG_PATH
+        path.write_text('proxy-groups:\n  - name: main\n    use: [broken, Paper]\n'
+                        'proxy-providers:\n  broken: {type: http}\n  Paper: {type: http}\n')
+        client = Controller({'a': 25})
+        client.selected['main'] = 'a'
+        original = client.provider
+
+        def read(name):
+            if name == 'broken':
+                raise RuntimeError('provider unavailable')
+            return original(name)
+
+        with mock.patch.object(client, 'provider', side_effect=read):
+            self.run_watchdog(client)
+        self.assertEqual(client.events, [('check', 'a')])
+
+    def test_yaml_use_anchors_and_provider_validation(self):
+        path = module.MIHOMO_CONFIG_PATH
+        path.write_text('providers: &used [Paper, Paper-backup]\n'
+                        'proxy-groups:\n  - name: main\n    use: *used\n'
+                        '  - name: Roblox\n    type: select\n'
+                        'proxy-providers:\n  Paper: {type: http}\n'
+                        '  Paper-backup: {type: http}\n')
+        self.assertEqual(module.configured_providers('main'), ['Paper', 'Paper-backup'])
+        with self.assertRaisesRegex(RuntimeError, 'exactly one'):
+            module.configured_providers('missing')
+        with self.assertRaisesRegex(RuntimeError, 'use list'):
+            module.configured_providers('Roblox')
+        path.write_text(path.read_text().replace('Paper-backup: {type: http}', 'Other: {type: http}'))
+        with self.assertRaisesRegex(RuntimeError, 'proxy-providers'):
+            module.configured_providers('main')
+
+    def test_invalid_yaml_does_not_expose_subscription(self):
+        module.MIHOMO_CONFIG_PATH.write_text('private-url: [https://secret.example/token\n')
+        with self.assertRaisesRegex(RuntimeError, 'Invalid YAML') as raised:
+            module.configured_providers('main')
+        self.assertNotIn('secret.example', str(raised.exception))
+
+    def test_zero_history_restores_service_then_refreshes_target_providers_only(self):
         client = Controller({'dead': 0, 'a': 25}, histories={'dead': 0, 'a': 0})
         client.after_refresh = lambda c: c.histories.update(a=25)
         self.run_watchdog(client)
         self.assertLess(client.events.index(('select', 'main', 'a')),
                         client.events.index(('refresh', 'Paper')))
-        self.assertIn(('refresh', 'unused'), client.events)
+        self.assertNotIn(('refresh', 'unused'), client.events)
         self.assertEqual(client.selected['main'], 'a')
 
     def test_failed_shortlist_refreshes_and_rereads_membership(self):
@@ -153,7 +208,7 @@ class TestFailover(unittest.TestCase):
             self.run_watchdog(client, {'a': RuntimeError('download failed')})
         self.assertEqual(client.selected['main'], 'a')
         self.assertEqual(client.events.count(('refresh', 'Paper')), 1)
-        self.assertEqual(client.events.count(('refresh', 'unused')), 1)
+        self.assertEqual(client.events.count(('refresh', 'unused')), 0)
         self.assertEqual(len([e for e in client.events if e[0] == 'download']), 2)
 
     def test_all_offline_after_refresh_is_error_without_selection(self):

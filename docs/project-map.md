@@ -8,7 +8,8 @@ Status: failover redesign implemented and locally verified on 2026-10-15; no rou
 | --- | --- |
 | `net/router-watchdog/files/opt/libexec/router-watchdog/router_watchdog.py` | Runtime, CLI, Mihomo HTTP API client, healthchecks, throughput measurement, selection, logging, lock, cron management. Uses the Python standard library and PyYAML for target-group provider references. |
 | `net/router-watchdog/files/opt/bin/router-watchdog` | Shell entry point; replaces itself with `/opt/bin/python3` running the runtime and forwards arguments. |
-| `net/router-watchdog/files/opt/etc/router-watchdog.json` | Package default configuration; installation registers it as a conffile. |
+| `net/router-watchdog/files/opt/libexec/router-watchdog/merge_config.py` | Installation-time recursive defaults merge, exact `-old` backup and atomic writes with private permissions. Pre-install stages the exact original as `router-watchdog.json-upgrade` before opkg unpacking; post-install merges it before cron synchronization and removes staging only after success. |
+| `net/router-watchdog/files/opt/etc/router-watchdog.json` | Package default configuration; also installed as `/opt/share/router-watchdog/defaults.json` for post-install merging into the registered conffile. Filled user fields survive only within the new schema; lists are replaced wholesale. |
 | `net/router-watchdog/files/opt/etc/cron.1min/router-watchdog` | Existing Entware hook; executes `--sync-cron`, not the selection algorithm. |
 | `net/router-watchdog/Makefile` | Entware/OpenWrt package definition, dependencies, installation, post-install cron synchronization, pre-removal cron cleanup. Inspected version: `1.0.6-1`; architecture `all`. |
 | `net/router-watchdog/test.sh` | Installed-package smoke check; requires router paths and is not a host-side unit-test runner. |

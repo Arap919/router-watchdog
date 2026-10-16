@@ -6,9 +6,10 @@ Status: failover redesign implemented and locally verified on 2026-10-15; no rou
 
 | Path | Responsibility |
 | --- | --- |
-| `net/router-watchdog/files/opt/libexec/router-watchdog/router_watchdog.py` | Runtime, CLI, Mihomo HTTP API client, healthchecks, throughput measurement, selection, logging, lock, cron management. Uses Python standard library only. |
+| `net/router-watchdog/files/opt/libexec/router-watchdog/router_watchdog.py` | Runtime, CLI, Mihomo HTTP API client, healthchecks, throughput measurement, selection, logging, lock, cron management. Uses the Python standard library and PyYAML for target-group provider references. |
 | `net/router-watchdog/files/opt/bin/router-watchdog` | Shell entry point; replaces itself with `/opt/bin/python3` running the runtime and forwards arguments. |
-| `net/router-watchdog/files/opt/etc/router-watchdog.json` | Package default configuration; installation registers it as a conffile. |
+| `net/router-watchdog/files/opt/libexec/router-watchdog/merge_config.py` | Installation-time recursive defaults merge, exact `-old` backup and atomic writes with private permissions. Pre-install stages the exact original as `router-watchdog.json-upgrade` before opkg unpacking; post-install merges it before cron synchronization and removes staging only after success. |
+| `net/router-watchdog/files/opt/etc/router-watchdog.json` | Package default configuration; also installed as `/opt/share/router-watchdog/defaults.json` for post-install merging into the registered conffile. Filled user fields survive only within the new schema; lists are replaced wholesale. |
 | `net/router-watchdog/files/opt/etc/cron.1min/router-watchdog` | Existing Entware hook; executes `--sync-cron`, not the selection algorithm. |
 | `net/router-watchdog/Makefile` | Entware/OpenWrt package definition, dependencies, installation, post-install cron synchronization, pre-removal cron cleanup. Inspected version: `1.0.6-1`; architecture `all`. |
 | `net/router-watchdog/test.sh` | Installed-package smoke check; requires router paths and is not a host-side unit-test runner. |
@@ -27,6 +28,8 @@ Status: failover redesign implemented and locally verified on 2026-10-15; no rou
 ## Runtime boundaries
 
 `main()` handles `--help`, `--sync-cron`, `--remove-cron`, `--clear-log` (optionally `--if-due`), configuration loading, shared action locking and exit codes. `choose_and_apply()` owns the failover flow. `validate_config()` checks/defaults settings before controller access. `target_candidates()` filters actual production-group members, `restore_service()` applies the first freshly confirmed fallback, `check_candidates()` performs parallel checks (with immediate fallback during recovery), `benchmark_candidates()` isolates testing, and `choose_winner()` applies the latency window. `measure_speed()` selects a node then performs parallel download streams and takes the median across rounds.
+
+Normal runs read `/opt/etc/mihomo/config.yaml` with PyYAML and validate target-group `use` entries against `proxy-providers`; current-node lookup, discovery and recovery are restricted to that list. Unrelated providers are never enumerated during normal runs.
 
 `Mihomo` bypasses system proxies for controller requests. Provider data and provider names are cached within the client. `update_provider()` invalidates provider details. Fresh healthchecks use provider-owned `testUrl` and `expectedStatus` through `/providers/proxies/{provider}/{node}/healthcheck`; positive integer delay confirms availability. `latest_history_delay()` considers only the last history entry; zero/absent delay is unavailable history.
 
@@ -60,7 +63,7 @@ The schedule runs every minute from 07:00 to 01:00 and every 30 minutes from 01:
 
 ## Implemented behavior and validation limits
 
-A healthy current node exits immediately after its provider-owned fresh check. On failure, the first working eligible group member is selected before benchmarks. Last positive history ranks top_n candidates; fresh checks confirm availability and all responding shortlisted nodes are measured only through BENCHMARK. Among successful measurements within +50 ms of the minimum fresh delay, greatest speed wins. Failure of history, checks, speed tests or initial restoration triggers one all-provider refresh and a new fresh-check/rank/benchmark pass. A successful recovery check applies an emergency fallback immediately; failed measurements retain it and report an error.
+A healthy current node exits immediately after its provider-owned fresh check. On failure, the first working eligible group member is selected before benchmarks. Last positive history ranks top_n candidates; fresh checks confirm availability and all responding shortlisted nodes are measured only through BENCHMARK. Among successful measurements within +50 ms of the minimum fresh delay, greatest speed wins. Failure of history, checks, speed tests or initial restoration triggers one refresh of providers referenced by the target group's YAML `use` list and a new fresh-check/rank/benchmark pass. A successful recovery check applies an emergency fallback immediately; failed measurements retain it and report an error.
 
 The reference YAML uses shared list anchors, the existing subscription selector first, an explicit built-in GLOBAL display order, and a hidden benchmark selector with a loopback listener. Existing `Global` remains because routing rules reference it; its undefined `Proxy` member was replaced with the existing subscription/DIRECT choices. Provider settings, DNS and routing rules were compared structurally before/after and preserved.
 

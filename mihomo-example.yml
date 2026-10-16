@@ -1,0 +1,602 @@
+#====================================================
+#                 CORE
+#====================================================
+
+port: 7890
+socks-port: 7891
+mixed-port: 1080
+redir-port: 1182
+tproxy-port: 1181
+
+listeners:
+  - name: benchmark-in
+    type: http
+    port: 17890
+    listen: 0.0.0.0
+    proxy: BENCHMARK
+    users: []
+
+allow-lan: true
+bind-address: "*"
+
+mode: rule
+log-level: silent
+
+ipv6: false
+tcp-concurrent: true
+unified-delay: true
+
+find-process-mode: off
+
+external-controller: 0.0.0.0:9090
+
+external-ui: ./zash
+external-ui-url: https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+#====================================================
+#                 GEO DATA
+#====================================================
+
+geodata-mode: true
+geo-auto-update: true
+geo-update-interval: 168
+
+geox-url:
+  geoip: https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.dat
+  geosite: https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+
+#====================================================
+#                 SNIFFER
+#====================================================
+
+sniffer:
+  enable: true
+  force-dns-mapping: true
+
+  sniff:
+
+    HTTP:
+      ports: [80]
+      override-destination: true
+
+    TLS:
+      ports: [443]
+
+    QUIC:
+      ports: [443]
+
+#====================================================
+#                 DNS
+#====================================================
+
+dns:
+  enable: true
+
+  listen: 0.0.0.0:7874
+
+  ipv6: false
+
+  use-hosts: true
+  respect-rules: true
+
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+
+  cache-algorithm: arc
+
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+
+  proxy-server-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+
+  nameserver:
+    - https://cloudflare-dns.com/dns-query
+    - https://dns.google/dns-query
+
+  fake-ip-filter-mode: blacklist
+
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "localhost"
+
+    - +.msftconnecttest.com
+    - +.msftncsi.com
+    - +.connectivitycheck.gstatic.com
+    - +.detectportal.firefox.com
+
+    - +.pool.ntp.org
+    - +.ntp.org
+    - +.time.windows.com
+    - +.3gppnetwork.org
+#====================================================
+#              PROXY PROVIDERS
+#====================================================
+
+proxy-providers:
+
+  BlancVPN:
+    type: http
+    url: YOUR_URL_HERE
+
+    interval: 43200
+
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+      expected-status: 204
+
+    header:
+      User-Agent:
+        - ClashMeta/1.19.24; mihomo/1.19.24
+      x-hwid:
+        - "322ABB229131"
+
+    override:
+      udp: true
+      tfo: true
+
+  PaperVPN:
+    type: http
+    url: YOUR_URL_HERE
+
+    interval: 43200
+
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+      expected-status: 204
+
+    override:
+      udp: true
+      tfo: true
+#====================================================
+#                 PROXY GROUPS
+#====================================================
+
+proxy-groups:
+
+  - name: BENCHMARK
+    type: select
+    use:
+      - BlancVPN
+    hidden: true
+
+  #
+  # Источник прокси
+  #
+  - name: Proxy
+    type: select
+    use:
+      - BlancVPN
+      - PaperVPN
+
+  #
+  # Основной маршрут
+  #
+  - name: Global
+    type: select
+    proxies:
+      - Proxy
+      - DIRECT
+
+  #
+  # Российский трафик
+  #
+  - name: Russia
+    type: select
+    proxies:
+      - DIRECT
+      - Proxy
+
+  #
+  # Искусственный интеллект
+  #
+  - name: AI
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+
+  #
+  # Google
+  #
+  - name: Google
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+
+  #
+  # GitHub
+  #
+  - name: GitHub
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+
+  #
+  # Microsoft
+  #
+  - name: Microsoft
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+
+  #
+  # Apple
+  #
+  - name: Apple
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+
+  #
+  # Telegram
+  #
+  - name: Telegram
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+
+  #
+  # Discord
+  #
+  - name: Discord
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+
+  #
+  # YouTube
+  #
+  - name: YouTube
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+      
+  #
+  # Steam
+  #
+  - name: Steam
+    type: select
+    proxies:
+      - DIRECT
+      - Global
+
+  #
+  # Медиа
+  #
+  - name: Media
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+
+  #
+  # Социальные сети
+  #
+  - name: Social
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+
+  #
+  # Speedtest
+  #
+  - name: 'Speedtest'
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/227645/speedometer.svg"
+
+  #
+  # Проверка IP
+  #
+  - name: IP Check
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+
+  #
+  # Торренты / разные сайты
+  #
+  - name: Other
+    type: select
+    proxies:
+      - DIRECT
+      - Global
+
+  #
+  # Для взрослых
+  #
+  - name: Adult
+    type: select
+    proxies:
+      - Global
+      - DIRECT
+
+  #
+  # Реклама
+  #
+  - name: Ads
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+      
+#====================================================
+#               RULE PROVIDERS
+#====================================================
+
+rule-providers:
+
+  ads:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://github.com/zxc-rv/ad-filter/releases/latest/download/adlist.mrs
+    path: ./rules/ads.mrs
+    interval: 86400
+
+  discord:
+    type: inline
+    behavior: classical
+    format: text
+    payload:
+      - "AND,((DOMAIN-KEYWORD,discord),(NOT,((DOMAIN-SUFFIX,ru))))"
+      - "AND,((IP-CIDR,34.0.192.0/18,no-resolve),(NETWORK,UDP),(DST-PORT,50000-50100))"
+      - "AND,((IP-CIDR,35.192.0.0/11,no-resolve),(NETWORK,UDP),(DST-PORT,50000-50100))"
+      - "AND,((IP-CIDR,66.22.192.0/18,no-resolve),(NETWORK,UDP),(DST-PORT,50000-50100))"
+      
+#====================================================
+#                    RULES
+#====================================================
+
+rules:
+
+  #--------------------------------------------------
+  # Личные сайты
+  #--------------------------------------------------
+
+  - DOMAIN-SUFFIX,myteamspeak.ru,Global
+  - DOMAIN-SUFFIX,myteamspeak.com,Global
+  - DOMAIN-SUFFIX,papervpn.io,Global
+  - DOMAIN-SUFFIX,blancvpn.com,Global
+  - DOMAIN-SUFFIX,vpnguild.org,Global
+  - DOMAIN-SUFFIX,ghfast.top,Global
+
+  - DOMAIN-SUFFIX,habr.com,Global
+  - DOMAIN-SUFFIX,cleanvoice.ru,Global
+  - DOMAIN-SUFFIX,dreamerscast.com,Global
+  - DOMAIN-SUFFIX,saveeditor.online,Global
+  - DOMAIN-SUFFIX,movespeed.com,Global
+  - DOMAIN-SUFFIX,jamisbikes.com,Global
+
+  #--------------------------------------------------
+  # Реклама
+  #--------------------------------------------------
+
+  - GEOSITE,category-ads-all,Ads
+  # - RULE-SET,ads,Ads
+
+  #--------------------------------------------------
+  # Локальная сеть
+  #--------------------------------------------------
+
+  - GEOIP,private,DIRECT,no-resolve
+
+  #--------------------------------------------------
+  # Россия
+  #--------------------------------------------------
+
+  - DOMAIN-SUFFIX,avito.ru,DIRECT
+  - DOMAIN-SUFFIX,perekrestok.ru,DIRECT
+
+  - GEOSITE,category-gov-ru,Russia
+
+  - GEOSITE,category-ru,Russia
+
+  - GEOIP,RU,Russia,no-resolve
+  
+  #--------------------------------------------------
+  # Speedtest
+  #--------------------------------------------------
+  
+  - GEOSITE,speedtest,Speedtest
+  - GEOSITE,ookla-speedtest,Speedtest
+  - GEOSITE,category-speedtest,Speedtest
+
+  #--------------------------------------------------
+  # Проверка IP
+  #--------------------------------------------------
+
+  - DOMAIN-SUFFIX,2ip.io,IP Check
+  - DOMAIN-SUFFIX,2ip.ru,IP Check
+  - DOMAIN-SUFFIX,ipinfo.io,IP Check
+  - DOMAIN-SUFFIX,ip-api.com,IP Check
+  - DOMAIN-SUFFIX,ip.sb,IP Check
+  - DOMAIN-SUFFIX,ipify.org,IP Check
+  - DOMAIN-SUFFIX,ident.me,IP Check
+  - DOMAIN-SUFFIX,icanhazip.com,IP Check
+  - DOMAIN-SUFFIX,ipleak.net,IP Check
+  - DOMAIN-SUFFIX,myip.com,IP Check
+  - DOMAIN-SUFFIX,myexternalip.com,IP Check
+  - DOMAIN-SUFFIX,whatismyip.com,IP Check
+  - DOMAIN-SUFFIX,whatismyipaddress.com,IP Check
+  
+  #--------------------------------------------------
+  # Google
+  #--------------------------------------------------
+
+  - GEOSITE,google,Google
+  - GEOSITE,youtube,YouTube
+  - GEOSITE,google-scholar,Google
+
+  #--------------------------------------------------
+  # AI
+  #--------------------------------------------------
+
+  - GEOSITE,openai,AI
+  - GEOSITE,google-gemini,AI
+  - GEOSITE,anthropic,AI
+
+  - DOMAIN-SUFFIX,x.ai,AI
+  - DOMAIN-SUFFIX,grok.com,AI
+  - DOMAIN-SUFFIX,claude.ai,AI
+  - DOMAIN-SUFFIX,chatgpt.com,AI
+
+  #--------------------------------------------------
+  # GitHub
+  #--------------------------------------------------
+
+  - GEOSITE,github,GitHub
+
+  #--------------------------------------------------
+  # Microsoft
+  #--------------------------------------------------
+
+  - GEOSITE,microsoft,Microsoft
+
+  #--------------------------------------------------
+  # Apple
+  #--------------------------------------------------
+
+  - GEOSITE,apple,Apple
+
+  #--------------------------------------------------
+  # Telegram
+  #--------------------------------------------------
+
+  - GEOSITE,telegram,Telegram
+  - GEOIP,telegram,Telegram
+
+  #--------------------------------------------------
+  # Discord
+  #--------------------------------------------------
+
+  - RULE-SET,discord,Discord
+
+  #--------------------------------------------------
+  # Социальные сети
+  #--------------------------------------------------
+
+  - GEOSITE,facebook,Social
+  - GEOSITE,instagram,Social
+  - GEOSITE,twitter,Social
+  - GEOSITE,x,Social
+  - GEOSITE,threads,Social
+  - GEOSITE,linkedin,Social
+
+  #--------------------------------------------------
+  # Видео
+  #--------------------------------------------------
+
+  - GEOSITE,netflix,Media
+  - GEOSITE,tiktok,Media
+  - GEOSITE,twitch,Media
+
+  #--------------------------------------------------
+  # Музыка
+  #--------------------------------------------------
+
+  - GEOSITE,spotify,Media
+  - GEOSITE,tidal,Media
+
+  #--------------------------------------------------
+  # Игры
+  #--------------------------------------------------
+
+  - GEOSITE,steam,Steam
+
+  #--------------------------------------------------
+  # Облака
+  #--------------------------------------------------
+
+  - GEOSITE,onedrive,Microsoft
+  - GEOSITE,icloud,Apple
+
+  #--------------------------------------------------
+  # Amazon
+  #--------------------------------------------------
+
+  - GEOSITE,amazon,Global
+
+  #--------------------------------------------------
+  # Cloudflare
+  #--------------------------------------------------
+
+  - GEOSITE,cloudflare,Global
+
+  #--------------------------------------------------
+  # Fastly
+  #--------------------------------------------------
+
+  - GEOSITE,fastly,Global
+
+  #--------------------------------------------------
+  # Akamai
+  #--------------------------------------------------
+
+  - GEOSITE,akamai,Global
+
+  #--------------------------------------------------
+  # Intel
+  #--------------------------------------------------
+
+  - GEOSITE,intel,Global
+
+  #--------------------------------------------------
+  # Speedtest
+  #--------------------------------------------------
+
+  - GEOSITE,category-speedtest,Global
+
+  #--------------------------------------------------
+  # Notion
+  #--------------------------------------------------
+
+  - GEOSITE,notion,Global
+  
+  #--------------------------------------------------
+  # Для взрослых
+  #--------------------------------------------------
+
+  - GEOSITE,category-porn,Adult
+
+  #--------------------------------------------------
+  # Торренты
+  #--------------------------------------------------
+# видимо для запуска на пк. пускай будет
+#  - PROCESS-NAME,qbittorrent.exe,DIRECT
+#  - PROCESS-NAME,transmission-qt.exe,DIRECT
+
+  #--------------------------------------------------
+  # Локальные сети
+  #--------------------------------------------------
+
+  - GEOIP,LAN,DIRECT,no-resolve
+
+  #--------------------------------------------------
+  # Остальной трафик
+  #--------------------------------------------------
+
+  - MATCH,Other

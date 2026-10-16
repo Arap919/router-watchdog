@@ -58,7 +58,7 @@ The main selector may change only for emergency restoration or final winner appl
 
 Trigger recovery if history yields no usable candidates, all shortlisted fresh healthchecks fail, all speed tests fail, or no emergency fallback can be confirmed.
 
-1. Update all proxy providers, then perform fresh healthchecks for eligible production-group nodes and rebuild the current candidate data. Provider updates must invalidate cached details, and membership must be re-read because subscription contents can change.
+1. Update only proxy providers referenced by the target group's `use` list in `/opt/etc/mihomo/config.yaml`, then perform fresh healthchecks for eligible production-group nodes and rebuild the current candidate data. Provider updates must invalidate cached details, and membership must be re-read because subscription contents can change.
 2. If service is still unconfirmed, immediately apply the first freshly confirmed working eligible node before benchmarking.
 3. Rank by the latest delay after the fresh checks, take `top_n`, and perform the same candidate checks, isolated speed measurements and winner selection.
 4. If no eligible nodes work after refresh and fresh checks, exit with an error and a clear log entry.
@@ -66,7 +66,7 @@ Trigger recovery if history yields no usable candidates, all shortlisted fresh h
 
 The normal path avoids unconditional subscription updates. Recovery is one bounded pass; existing per-provider refresh retries may remain. A provider that fails to update must be logged; partial provider-update failure is not proof that every node is unavailable.
 
-The original request says to update **all** proxy providers during recovery, while normal candidate discovery and all selections remain restricted to `target_group`. This distinction must remain explicit in implementation and tests.
+Updated requirement (2026-10-16): resolve provider names exclusively from `proxy-groups[name=target_group].use` in `/opt/etc/mihomo/config.yaml`, validating each against `proxy-providers`. Current-node checks, candidate discovery and recovery updates must use only those providers. Do not enumerate unrelated API providers or treat selectors as providers. Missing or invalid YAML references fail explicitly; never log subscription URLs.
 
 ## Winner policy
 

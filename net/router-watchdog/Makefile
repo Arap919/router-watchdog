@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=router-watchdog
-PKG_VERSION:=1.0.8
+PKG_VERSION:=1.0.9
 PKG_RELEASE:=1
 PKG_MAINTAINER:=Arap919
 PKG_LICENSE:=MIT
@@ -22,10 +22,6 @@ Cron-friendly Mihomo failover watchdog for provider-backed selector groups.
 The package checks the currently selected proxy with a fresh provider healthcheck,
 selects healthy candidates, benchmarks them through the local HTTP proxy and
 switches the target selector to the best candidate.
-endef
-
-define Package/router-watchdog/conffiles
-/opt/etc/router-watchdog.json
 endef
 
 define Package/router-watchdog/preinst
@@ -66,7 +62,6 @@ define Package/router-watchdog/install
 	$(INSTALL_BIN) ./files/opt/libexec/router-watchdog/router_watchdog.py $(1)/opt/libexec/router-watchdog/router_watchdog.py
 	$(INSTALL_BIN) ./files/opt/libexec/router-watchdog/merge_config.py $(1)/opt/libexec/router-watchdog/merge_config.py
 	$(INSTALL_DATA) ./files/opt/etc/router-watchdog.json $(1)/opt/share/router-watchdog/defaults.json
-	$(INSTALL_CONF) ./files/opt/etc/router-watchdog.json $(1)/opt/etc/router-watchdog.json
 	$(INSTALL_BIN) ./files/opt/etc/cron.1min/router-watchdog $(1)/opt/etc/cron.1min/router-watchdog
 endef
 

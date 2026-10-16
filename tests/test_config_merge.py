@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import pathlib
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -110,3 +111,38 @@ class TestConfigMerge(unittest.TestCase):
             self.assertEqual(json.loads(config.read_text()), {'a': 2, 'new': 3})
             self.assertEqual((root / 'config.json-old').read_text(), '{ "a": 2 }')
             self.assertFalse(staged.exists())
+
+    def test_package_ships_only_defaults_and_does_not_register_conffile(self):
+        package = PATH.parents[4]
+        makefile = (package / 'Makefile').read_text()
+        self.assertNotIn('define Package/router-watchdog/conffiles', makefile)
+        body = makefile.split('define Package/router-watchdog/install\n', 1)[1].split('\nendef', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            script = body.replace('$(1)', directory)
+            for macro, command in [('INSTALL_DIR', 'mkdir -p'), ('INSTALL_BIN', 'install -m 755'),
+                                   ('INSTALL_DATA', 'install -m 644'), ('INSTALL_CONF', 'install -m 600')]:
+                script = script.replace('$(' + macro + ')', command)
+            subprocess.run(['sh', '-eu', '-c', script], cwd=package, check=True,
+                           capture_output=True)
+            root = pathlib.Path(directory)
+            self.assertFalse((root / 'opt/etc/router-watchdog.json').exists())
+            self.assertTrue((root / 'opt/share/router-watchdog/defaults.json').is_file())
+
+    def test_legacy_upgrade_restores_config_removed_during_unpack(self):
+        package = PATH.parents[4]
+        makefile = (package / 'Makefile').read_text()
+        preinst = makefile.split('define Package/router-watchdog/preinst\n', 1)[1].split('\nendef', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            defaults, config = root / 'defaults.json', root / 'router-watchdog.json'
+            original = '{ "a": 2 }\n'
+            defaults.write_text('{"a": 9, "new": 3}')
+            config.write_text(original)
+            script = preinst.replace('$$', '$').replace('/opt/etc/router-watchdog.json', str(config))
+            with mock.patch.dict('os.environ', {'IPKG_INSTROOT': ''}):
+                subprocess.run(['sh', '-eu', '-c', script], check=True, capture_output=True)
+            config.unlink()  # Legacy package file becomes obsolete during opkg unpack.
+            module.install(defaults, config)
+            self.assertEqual(json.loads(config.read_text()), {'a': 2, 'new': 3})
+            self.assertEqual((root / 'router-watchdog.json-old').read_text(), original)
+            self.assertFalse((root / 'router-watchdog.json-upgrade').exists())

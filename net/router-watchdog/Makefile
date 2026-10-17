@@ -27,7 +27,8 @@ endef
 define Package/router-watchdog/preinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
-if [ -f /opt/etc/router-watchdog.json ]; then
+# Retain the original across retries if an earlier postinst failed after unpack.
+if [ -f /opt/etc/router-watchdog.json ] && [ ! -e /opt/etc/router-watchdog.json-upgrade ]; then
     umask 077
     cp /opt/etc/router-watchdog.json /opt/etc/router-watchdog.json-upgrade || exit 1
 fi
@@ -62,6 +63,9 @@ define Package/router-watchdog/install
 	$(INSTALL_BIN) ./files/opt/libexec/router-watchdog/router_watchdog.py $(1)/opt/libexec/router-watchdog/router_watchdog.py
 	$(INSTALL_BIN) ./files/opt/libexec/router-watchdog/merge_config.py $(1)/opt/libexec/router-watchdog/merge_config.py
 	$(INSTALL_DATA) ./files/opt/etc/router-watchdog.json $(1)/opt/share/router-watchdog/defaults.json
+	# Keep legacy ownership through unpack; do not register this as a conffile.
+	# preinst stages user data and postinst replaces this seed with the merged JSON.
+	$(INSTALL_CONF) ./files/opt/etc/router-watchdog.json $(1)/opt/etc/router-watchdog.json
 	$(INSTALL_BIN) ./files/opt/etc/cron.1min/router-watchdog $(1)/opt/etc/cron.1min/router-watchdog
 endef
 

@@ -84,3 +84,27 @@ git diff --check
 Do not run the normal watchdog, `--sync-cron` or `--remove-cron` against production during local verification. Unit tests mock controller calls and redirect filesystem effects. Package builds require the Entware build environment; Python compilation/unit tests do not prove router execution or an IPK build.
 
 When adding config fields, update defaults, runtime validation, tests, root README and `.github/workflows/lint.yml`'s exact key set together. The CI Cyrillic check now covers runtime source only; the user-facing README is Russian and technical runtime logs remain English.
+
+## Manual speed operations and local MCP
+
+`manual_speed()` reuses `target_candidates`, `fresh_check`, `check_candidates`, `measure_speed` and `choose_winner`. CLI actions `--measure-selected` and `--find-faster` return JSON under the existing shared lock; `--apply` is valid only with `--find-faster`. Machine-mode logs go to stderr; busy and operation failures return nonzero status and sanitized JSON. Automatic failover is unchanged.
+
+`tools/xkeen_mcp.py` is a local stdio MCP server using the Python SDK 1.x. It executes fixed SSH commands on port 222 by default. `measure_selected_node` measures the baseline; `find_faster_node` compares up to top_n fresh lowest-latency alternatives plus baseline, using the existing 50 ms winner window. Applying requires both `apply=true` and local `XKEEN_ALLOW_APPLY=1`; only a strictly faster measured winner can be applied. The server does not deploy itself or the router package.
+
+Tests: `tests/test_manual_speed.py` covers selection isolation, baseline errors, comparison, switching and CLI locking/output; `tests/test_mcp_server.py` covers SSH boundaries; `tests/test_mcp_stdio.py` uses a real SDK client/server with fake SSH. See `tools/README.md` for setup and validation boundaries.
+
+## Configurable speed service and config MCP tools
+
+`speed_test_url` defaults to the previous Cloudflare download endpoint. `download_url()` accepts HTTP(S) templates with only `{bytes}` and `{cache_bust}`, or a static file URL; `measure_speed()` forwards it to every download stream. Existing configs without the field retain the default. Package defaults, runtime validation and CI key checks include the new field.
+
+`CONFIG_FIELDS` matches the packaged schema. `config_view()` exposes recognized saved fields excluding `secret`; `update_config()` rejects unknown patch keys and validates the merged config before an atomic mode-0600 replacement. Existing unspecified and legacy fields remain unchanged. Nested schedule keys are validated by `cron_entries()`. The caller holds the shared lock. A changed schedule returns `cron_sync_required=true`; no implicit crontab update occurs.
+
+CLI `--get-config` and `--update-config` return JSON; the latter accepts a partial JSON object (up to 64 KiB) on stdin. MCP tools `get_watchdog_config` and `update_watchdog_config` use these fixed commands; patch values never enter shell command text. `tests/test_config_tools.py` checks URL handling, schema matching, validation, preservation, private permissions, atomic failure and CLI locking/redaction. Extended SSH and stdio tests cover the new tools.
+
+Manual speed operations synchronize `benchmark_group` with the concrete current `target_group` member before the first healthcheck. The selection is verified; failed synchronization aborts before measurements. Both CLI and MCP share this path; automatic failover is unchanged.
+
+## Release artifact promotion (1.0.10)
+
+`.github/workflows/build-package.yml` builds IPK/feed for PRs and main pushes only. Tag pushes run a separate `release` job, never the Entware builder. `.github/scripts/select_release_build.py` resolves the checked-out tag commit to a successful completed `push` run of this workflow on `main`, using full SHA matching and paginated run/artifact APIs. Both artifacts must be available and nonexpired in the same run. No other commit or automatic build fallback is allowed.
+
+Release and Pages jobs download immutable artifacts by ID and run ID with `actions: read`. Before release publication, the tag/Makefile/IPK versions, package identity/architecture and feed bytes/checksum/size/compressed metadata are verified. Pages downloads the same selected feed after release succeeds. Existing manual feed republication is unchanged. `tests/test_release_workflow.py` covers selection, pagination, missing/expired artifacts, tag job wiring and actual payload verification scripts using local IPK fixtures.

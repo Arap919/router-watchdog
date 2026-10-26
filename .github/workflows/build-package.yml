@@ -20,31 +20,15 @@ permissions:
 
 jobs:
   build:
-    if: github.event_name != 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Verify release tag matches package version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          set -eu
-
-          package_version=$(sed -n 's/^PKG_VERSION:=//p' net/router-watchdog/Makefile)
-          tag_version=${GITHUB_REF_NAME#v}
-
-          echo "Package version: $package_version"
-          echo "Release tag:      $tag_version"
-
-          test "$package_version" = "$tag_version" || {
-            echo "Package version $package_version does not match tag $GITHUB_REF_NAME" >&2
-            exit 1
-          }
 
       - name: Prepare Entware builder
         run: |
@@ -411,20 +395,133 @@ jobs:
           path: feed/
           if-no-files-found: error
 
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      actions: read
+
+    outputs:
+      source_run_id: ${{ steps.source.outputs.run_id }}
+      feed_artifact_id: ${{ steps.source.outputs.feed_artifact_id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Verify release tag matches package version
+        run: |
+          set -eu
+
+          package_version=$(sed -n 's/^PKG_VERSION:=//p' net/router-watchdog/Makefile)
+          tag_version=${GITHUB_REF_NAME#v}
+
+          echo "Package version: $package_version"
+          echo "Release tag:      $tag_version"
+
+          test "$package_version" = "$tag_version" || {
+            echo "Package version $package_version does not match tag $GITHUB_REF_NAME" >&2
+            exit 1
+          }
+
+      - name: Select successful main build for tag commit
+        id: source
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export SOURCE_SHA="$(git rev-parse HEAD)"
+          python3 .github/scripts/select_release_build.py
+
+      - name: Download existing package
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ steps.source.outputs.ipk_artifact_id }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: dist
+
+      - name: Download existing feed
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ steps.source.outputs.feed_artifact_id }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: feed
+
+      - name: Verify release payload
+        run: |
+          set -euo pipefail
+          python3 - <<'PYVERIFY'
+          import gzip
+          import hashlib
+          import io
+          import os
+          import re
+          import tarfile
+          from pathlib import Path
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+          makefile = Path('net/router-watchdog/Makefile').read_text()
+          version = re.search(r'^PKG_VERSION:=(.+)$', makefile, re.M).group(1).strip()
+          revision = re.search(r'^PKG_RELEASE:=(.+)$', makefile, re.M).group(1).strip()
+          require(os.environ['GITHUB_REF_NAME'] == 'v' + version, 'Tag/package version mismatch')
+          packages = list(Path('dist').glob('*.ipk'))
+          require(len(packages) == 1, 'Expected exactly one release IPK')
+          package = packages[0]
+
+          def member(archive, name):
+              matches = [item for item in archive.getmembers() if item.name.lstrip('./') == name]
+              require(len(matches) == 1 and matches[0].isfile(), 'Invalid IPK control structure')
+              return archive.extractfile(matches[0]).read()
+
+          with tarfile.open(package, 'r:gz') as outer:
+              control_archive = member(outer, 'control.tar.gz')
+          with tarfile.open(fileobj=io.BytesIO(control_archive), mode='r:gz') as inner:
+              control_text = member(inner, 'control').decode()
+
+          def fields(text):
+              return dict(line.split(': ', 1) for line in text.splitlines() if ': ' in line)
+
+          control = fields(control_text)
+          require(control.get('Package') == 'router-watchdog', 'Wrong package name')
+          require(control.get('Version') == version + '-' + revision, 'Wrong IPK version')
+          require(control.get('Architecture') == 'all', 'Wrong IPK architecture')
+          feed = Path('feed/all')
+          require(len(list(feed.glob('*.ipk'))) == 1, 'Expected exactly one feed IPK')
+          require((feed / package.name).read_bytes() == package.read_bytes(), 'Feed/release IPK mismatch')
+          metadata_bytes = (feed / 'Packages').read_bytes()
+          metadata = fields(metadata_bytes.decode())
+          for key in ('Package', 'Version', 'Architecture'):
+              require(metadata.get(key) == control[key], 'Feed control metadata mismatch')
+          require(metadata.get('Filename') == package.name, 'Feed filename mismatch')
+          require(metadata.get('SHA256sum') == hashlib.sha256(package.read_bytes()).hexdigest(),
+                  'Feed checksum mismatch')
+          require(metadata.get('Size') == str(package.stat().st_size), 'Feed size mismatch')
+          require(gzip.decompress((feed / 'Packages.gz').read_bytes()) == metadata_bytes,
+                  'Compressed feed metadata mismatch')
+          print('Verified existing IPK and feed for ' + os.environ['GITHUB_REF_NAME'])
+          PYVERIFY
+
       - name: Upload release asset
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.ipk
 
   publish-feed:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: release
 
     runs-on: ubuntu-latest
 
     permissions:
       contents: read
+      actions: read
       pages: write
       id-token: write
 
@@ -436,7 +533,9 @@ jobs:
       - name: Download feed artifact
         uses: actions/download-artifact@v7
         with:
-          name: router-watchdog-feed
+          artifact-ids: ${{ needs.release.outputs.feed_artifact_id }}
+          run-id: ${{ needs.release.outputs.source_run_id }}
+          github-token: ${{ github.token }}
           path: feed
 
       - name: Upload GitHub Pages artifact

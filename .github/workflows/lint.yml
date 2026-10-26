@@ -49,7 +49,7 @@ jobs:
               'controller', 'secret', 'target_group', 'benchmark_group', 'benchmark_proxy',
               'top_n', 'healthcheck_parallelism',
               'healthcheck_timeout_ms', 'speed_connect_timeout_seconds',
-              'switch_wait_seconds', 'download_bytes', 'parallel_streams',
+              'switch_wait_seconds', 'speed_test_url', 'download_bytes', 'parallel_streams',
               'multi_rounds', 'log_cleanup_days', 'schedule',
           }
           actual = set(config)

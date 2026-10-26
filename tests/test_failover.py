@@ -88,7 +88,7 @@ class TestFailover(unittest.TestCase):
     def run_watchdog(self, client, speeds=None):
         speeds = speeds or {}
 
-        def download(proxy, size, timeout):
+        def download(proxy, size, timeout, url_template):
             node = client.selected['BENCHMARK']
             client.events.append(('download', node, client.selected['main']))
             speed = speeds.get(node, 10)

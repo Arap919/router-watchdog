@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import math
 import os
 import re
 import subprocess
+import string
 import sys
 import tempfile
 import time
@@ -42,6 +44,15 @@ DEFAULT_SCHEDULE = {
         {"start": "01:00", "end": "07:00", "every_minutes": 30},
     ]
 }
+
+
+DEFAULT_SPEED_TEST_URL = "https://speed.cloudflare.com/__down?bytes={bytes}&cacheBust={cache_bust}"
+CONFIG_FIELDS = frozenset({
+    "controller", "secret", "target_group", "benchmark_group", "benchmark_proxy",
+    "top_n", "healthcheck_parallelism", "healthcheck_timeout_ms",
+    "speed_connect_timeout_seconds", "switch_wait_seconds", "speed_test_url",
+    "download_bytes", "parallel_streams", "multi_rounds", "log_cleanup_days", "schedule",
+})
 
 
 class MihomoAPIError(RuntimeError):
@@ -619,11 +630,33 @@ def check_group_nodes(
     log(f"Fresh healthcheck for group {group}: OK={total - failed}, FAIL={failed}, total={total}.")
 
 
-def download(proxy: str, bytes_to_get: int, connect_timeout: int) -> int:
+def download_url(template: str, size: int) -> str:
+    """Render only supported placeholders and validate the HTTP(S) service URL."""
+    try:
+        if not isinstance(template, str) or not template or any(ch.isspace() for ch in template):
+            raise ValueError
+        for _, field, spec, conversion in string.Formatter().parse(template):
+            if field is not None and (field not in {"bytes", "cache_bust"} or spec or conversion):
+                raise ValueError
+        url = template.format(bytes=size, cache_bust=time.time_ns())
+        parsed = urllib.parse.urlparse(url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username or parsed.password or parsed.fragment):
+            raise ValueError
+        parsed.port
+    except (ValueError, TypeError, KeyError, IndexError):
+        raise ValueError("speed_test_url must be an HTTP(S) URL using only {bytes} and {cache_bust}") from None
+    return url
+
+
+def download(
+    proxy: str, bytes_to_get: int, connect_timeout: int,
+    url_template: str = DEFAULT_SPEED_TEST_URL,
+) -> int:
+    url = download_url(url_template, bytes_to_get)
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": proxy, "https": proxy})
     )
-    url = f"https://speed.cloudflare.com/__down?bytes={bytes_to_get}&cacheBust={time.time_ns()}"
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "router-watchdog/4.0", "Cache-Control": "no-cache"},
@@ -669,7 +702,7 @@ def measure_speed(client: Mihomo, cfg: dict[str, Any], node: str) -> float:
         started = time.monotonic()
         with ThreadPoolExecutor(max_workers=streams) as pool:
             received = sum(
-                pool.map(lambda _: download(proxy, size, timeout), range(streams))
+                pool.map(lambda _: download(proxy, size, timeout, cfg.get("speed_test_url", DEFAULT_SPEED_TEST_URL)), range(streams))
             )
         elapsed = time.monotonic() - started
         speed = received * 8 / elapsed / 1_000_000
@@ -707,9 +740,10 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "top_n": 7, "healthcheck_parallelism": 6, "healthcheck_timeout_ms": 5000,
         "speed_connect_timeout_seconds": 5, "switch_wait_seconds": 0.7,
         "download_bytes": 25000000, "parallel_streams": 4, "multi_rounds": 2,
-        "log_cleanup_days": 3,
+        "log_cleanup_days": 3, "speed_test_url": DEFAULT_SPEED_TEST_URL,
     }
     result = {**defaults, **cfg}
+    download_url(result["speed_test_url"], 1_000_000)
     for key in ("controller", "target_group", "benchmark_group", "benchmark_proxy"):
         value = result.get(key)
         if not isinstance(value, str) or not value.strip():
@@ -952,6 +986,82 @@ def choose_and_apply(cfg: dict[str, Any]) -> None:
     log(f"Selected winner: {winner[0]} - {winner[2]:.2f} Mbps, {winner[1]} ms.")
 
 
+def manual_speed(
+    cfg: dict[str, Any], *, find_faster: bool = False, apply: bool = False,
+) -> dict[str, Any]:
+    """Measure a concrete selected member; callers must hold the shared lock."""
+    if apply and not find_faster:
+        raise ValueError("apply requires find_faster")
+    cfg = validate_config(cfg)
+    client = Mihomo(cfg["controller"], cfg.get("secret", ""))
+    group = cfg["target_group"]
+    selected = current_node(client, group)
+    providers = configured_providers(group)
+    nodes, data = target_candidates(client, group, providers)
+    baseline = next((item for item in nodes if item["name"] == selected), None)
+    if baseline is None:
+        raise RuntimeError("Current selection must be a concrete eligible provider-backed member")
+    benchmark = client.proxy_group(cfg["benchmark_group"])
+    members = benchmark.get("all")
+    if (benchmark.get("type") != "Selector" or not isinstance(members, list)
+            or selected not in members):
+        raise RuntimeError("Current node must belong to a Selector benchmark_group")
+    # Synchronize before healthchecks, not only when the first download starts.
+    client.select(cfg["benchmark_group"], selected, cfg["speed_connect_timeout_seconds"])
+    if current_node(client, cfg["benchmark_group"]) != selected:
+        raise RuntimeError("Failed to synchronize benchmark_group with the current target node")
+
+    def measure(item: dict[str, Any], delay: int) -> tuple[str, int, float]:
+        speed = measure_speed(client, cfg, item["name"])
+        if not math.isfinite(speed) or speed <= 0:
+            raise RuntimeError("Invalid measured throughput speed")
+        return item["name"], delay, speed
+
+    _, delay = fresh_check(client, baseline, data[baseline["provider"]],
+                           cfg["healthcheck_timeout_ms"])
+    if delay is None:
+        raise RuntimeError("Current node failed fresh healthcheck; speed comparison unavailable")
+    current = measure(baseline, delay)
+    results = [current]
+    failed = []
+    if find_faster:
+        others = [item for item in nodes if item["name"] != selected and item["name"] in members]
+        checked = check_candidates(client, cfg, others, data)
+        checked.sort(key=lambda pair: (pair[1], pair[0]["name"]))
+        for item, delay in checked[:cfg["top_n"]]:
+            try:
+                results.append(measure(item, delay))
+            except Exception:
+                # Never return controller/download exception text to MCP clients.
+                failed.append(item["name"])
+    winner = choose_winner(results)
+    faster = winner[2] > current[2]
+    if current_node(client, group) != selected:
+        raise RuntimeError("Target selection changed during measurement; no automatic switch performed")
+    applied = False
+    if apply and faster:
+        live = client.proxy_group(group)
+        if live.get("type") != "Selector" or winner[0] not in live.get("all", []):
+            raise RuntimeError("Winner is no longer an eligible target member")
+        client.select(group, winner[0])
+        if current_node(client, group) != winner[0]:
+            raise RuntimeError("Selection verification failed after switch; inspect current group state")
+        applied = True
+
+    def record(value: tuple[str, int, float]) -> dict[str, Any]:
+        return {"node": value[0], "delay_ms": value[1], "mbps": value[2]}
+
+    return {
+        "group": group, "measurement": "download_throughput", "unit": "Mbps",
+        "measured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "current": record(current), "winner": record(winner),
+        "results": [record(value) for value in results], "failed_speed_nodes": failed,
+        "faster": faster, "improvement_percent": (winner[2] / current[2] - 1) * 100,
+        "applied": applied, "selected_after": winner[0] if applied else selected,
+        "latency_window_ms": 50,
+    }
+
+
 def sync_cron(entries: list[str]) -> bool:
     changed = remove_legacy_watchdog_entries(CRONTAB_PATH)
     changed = update_managed_crontab(CRONTAB_PATH, entries) or changed
@@ -966,6 +1076,43 @@ def sync_cron(entries: list[str]) -> bool:
     if changed:
         restart_cron()
     return changed
+
+
+def config_view(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Expose only recognized settings; never return the controller secret."""
+    return {
+        "config": {key: value for key, value in cfg.items() if key in CONFIG_FIELDS and key != "secret"},
+        "editable_fields": sorted(CONFIG_FIELDS),
+        "secret_configured": bool(cfg.get("secret")),
+    }
+
+
+def update_config(cfg: dict[str, Any], changes: Any) -> dict[str, Any]:
+    """Validate a partial patch and atomically write it; caller holds shared lock."""
+    if not isinstance(changes, dict) or not changes or not set(changes) <= CONFIG_FIELDS:
+        raise ValueError("Patch must be a nonempty object containing only supported settings")
+    merged = {**cfg, **changes}
+    validate_config(merged)
+    updated = sorted(key for key in changes if key not in cfg or changes[key] != cfg[key])
+    result = {"updated_fields": updated,
+              "cron_sync_required": "schedule" in updated}
+    if not updated:
+        return result
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=CONFIG_PATH.parent,
+                                         prefix=".router-watchdog-config.", delete=False) as handle:
+            temporary_path = handle.name
+            os.chmod(temporary_path, 0o600)
+            json.dump(merged, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, CONFIG_PATH)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+    return result
 
 
 def main() -> int:
@@ -986,6 +1133,16 @@ def main() -> int:
         action="store_true",
         help="truncate the watchdog log file",
     )
+    action.add_argument("--measure-selected", action="store_true",
+                        help="measure selected node through BENCHMARK and return JSON")
+    action.add_argument("--find-faster", action="store_true",
+                        help="compare selected node with freshly checked candidates; return JSON")
+    action.add_argument("--get-config", action="store_true",
+                        help="return recognized configuration without the secret as JSON")
+    action.add_argument("--update-config", action="store_true",
+                        help="apply a validated partial JSON patch from stdin")
+    parser.add_argument("--apply", action="store_true",
+                        help="with --find-faster, apply only a faster winner")
     if any(value in {"-h", "--help"} for value in sys.argv[1:]):
         parser.print_help()
         return 0
@@ -994,16 +1151,25 @@ def main() -> int:
         help="with --clear-log, clear only after configured log_cleanup_days",
     )
     args = parser.parse_args()
+    machine = args.measure_selected or args.find_faster or args.get_config or args.update_config
+    if args.apply and not args.find_faster:
+        parser.error("--apply requires --find-faster")
     if args.if_due and not args.clear_log:
         parser.error("--if-due requires --clear-log")
 
     needs_config = args.sync_cron or args.if_due or not (args.clear_log or args.remove_cron)
     if needs_config and not CONFIG_PATH.exists():
+        if machine:
+            print(json.dumps({"error": "configuration_missing"}))
+            return 2
         log(f"Configuration file not found: {CONFIG_PATH}")
         return 2
     try:
         lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_WRONLY, 0o600)
     except OSError as exc:
+        if machine:
+            print(json.dumps({"error": "lock_unavailable"}))
+            return 1
         log(f"Failed to create watchdog lock {LOCK_PATH}: {exc}")
         return 1
 
@@ -1011,9 +1177,12 @@ def main() -> int:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            if machine:
+                print(json.dumps({"error": "busy"}))
+                return 1
             log("Previous run is still in progress; skipping.")
             return 0
-        if not args.clear_log:
+        if not args.clear_log and not machine:
             log(f"Lock acquired: {LOCK_PATH}, PID={os.getpid()}")
         cfg: dict[str, Any] = {}
         if needs_config:
@@ -1036,10 +1205,30 @@ def main() -> int:
             if changed:
                 log("Updated router-watchdog cron schedule.")
             return 0
+        if args.get_config:
+            print(json.dumps(config_view(cfg), ensure_ascii=False, allow_nan=False))
+            return 0
+        if args.update_config:
+            patch_text = sys.stdin.read(65537)
+            if len(patch_text) > 65536:
+                raise ValueError("Configuration patch exceeds 64 KiB")
+            result = update_config(cfg, json.loads(patch_text))
+            print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+            return 0
+        if machine:
+            with contextlib.redirect_stdout(sys.stderr):
+                result = manual_speed(cfg, find_faster=args.find_faster, apply=args.apply)
+            print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+            return 0
         choose_and_apply(cfg)
         log("Watchdog completed successfully.")
         return 0
     except Exception as exc:
+        if machine:
+            # Raw exceptions can include private URLs or tokens.
+            print(json.dumps({"error": "operation_failed",
+                              "message": "Operation failed; check settings and router state locally"}))
+            return 1
         if args.sync_cron:
             log(f"Failed to synchronize cron schedule: {exc}")
         elif args.remove_cron:

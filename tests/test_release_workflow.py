@@ -92,6 +92,7 @@ class TestReleasePayload(unittest.TestCase):
         (self.root / 'net/router-watchdog').mkdir(parents=True)
         (self.root / 'net/router-watchdog/Makefile').write_text('PKG_VERSION:=1.0.10\nPKG_RELEASE:=1\n')
         (self.root / 'dist').mkdir()
+        (self.root / 'dist/install.sh').write_text('#!/bin/sh\nset -eu\n')
         (self.root / 'feed/all').mkdir(parents=True)
 
     def package(self, version='1.0.10-1'):
@@ -112,6 +113,12 @@ class TestReleasePayload(unittest.TestCase):
         (self.root / 'feed/all/Packages').write_text(control.decode() + 'Filename: ' + package.name + '\nSHA256sum: ' + digest + '\nSize: ' + str(package.stat().st_size) + '\n')
         import gzip
         (self.root / 'feed/all/Packages.gz').write_bytes(gzip.compress((self.root / 'feed/all/Packages').read_bytes()))
+        (self.root / 'feed/update.json').write_text(json.dumps({
+            'schema_version': 1, 'latest_version': version,
+            'package_url': 'https://arap919.github.io/router-watchdog/all/' + package.name,
+            'sha256': digest, 'size': package.stat().st_size,
+            'release_url': 'https://github.com/Arap919/router-watchdog/releases/tag/v1.0.10',
+            'release_notes': ''}))
 
     def verify_result(self):
         return subprocess.run(['bash', '-c', self.verify], cwd=self.root,
@@ -131,6 +138,27 @@ class TestReleasePayload(unittest.TestCase):
         (self.root / 'feed/all/router-watchdog_1.0.10-1_all.ipk').write_bytes(b'other')
         self.assertNotEqual(self.verify_result().returncode, 0)
 
+    def test_manifest_must_match_selected_package(self):
+        self.package()
+        manifest_path = self.root / 'feed/update.json'
+        valid = json.loads(manifest_path.read_text())
+        for key, value in [('schema_version', 2), ('latest_version', '1.0.9-1'),
+                           ('sha256', '0' * 64), ('size', 1), ('size', True),
+                           ('package_url', 'https://example.com/package.ipk'),
+                           ('release_url', 'https://example.com/release'),
+                           ('release_notes', None)]:
+            with self.subTest(key=key):
+                manifest_path.write_text(json.dumps({**valid, key: value}))
+                self.assertNotEqual(self.verify_result().returncode, 0)
+
+    def test_missing_or_invalid_installer_fails_before_publication(self):
+        self.package()
+        installer = self.root / 'dist/install.sh'
+        installer.unlink()
+        self.assertNotEqual(self.verify_result().returncode, 0)
+        installer.write_text('#!/bin/sh\nif\n')
+        self.assertNotEqual(self.verify_result().returncode, 0)
+
     def test_tag_does_not_build_and_publish_uses_selected_run(self):
         self.assertIn("refs/heads/main", self.jobs['build']['if'])
         self.assertIn('pull_request', self.jobs['build']['if'])
@@ -144,3 +172,11 @@ class TestReleasePayload(unittest.TestCase):
             self.assertIn('run-id', step['with'])
             self.assertIn('artifact-ids', step['with'])
             self.assertIn('github-token', step['with'])
+        package_upload = next(step for step in self.jobs['build']['steps']
+                              if step.get('with', {}).get('name') == 'router-watchdog-ipk')
+        self.assertEqual(set(package_upload['with']['path'].splitlines()),
+                         {'dist/*.ipk', 'dist/install.sh'})
+        release_upload = next(step for step in self.jobs['release']['steps']
+                              if step.get('uses', '').startswith('softprops/action-gh-release@'))
+        self.assertEqual(set(release_upload['with']['files'].splitlines()),
+                         {'dist/*.ipk', 'dist/install.sh'})

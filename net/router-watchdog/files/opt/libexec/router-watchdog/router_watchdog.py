@@ -1141,6 +1141,11 @@ def main() -> int:
                         help="return recognized configuration without the secret as JSON")
     action.add_argument("--update-config", action="store_true",
                         help="apply a validated partial JSON patch from stdin")
+    action.add_argument("--check-update", action="store_true",
+                        help="check published package version and return JSON")
+    action.add_argument("--install-update", action="store_true",
+                        help="install an explicitly requested published version through opkg")
+    parser.add_argument("--expected-version", help="with --install-update, require exact X.Y.Z-N")
     parser.add_argument("--apply", action="store_true",
                         help="with --find-faster, apply only a faster winner")
     if any(value in {"-h", "--help"} for value in sys.argv[1:]):
@@ -1156,6 +1161,14 @@ def main() -> int:
         parser.error("--apply requires --find-faster")
     if args.if_due and not args.clear_log:
         parser.error("--if-due requires --clear-log")
+
+    if args.expected_version and not args.install_update:
+        parser.error("--expected-version requires --install-update")
+    if args.install_update and not args.expected_version:
+        parser.error("--install-update requires --expected-version")
+    if args.check_update or args.install_update:
+        import update_service
+        return update_service.main(args.expected_version if args.install_update else None)
 
     needs_config = args.sync_cron or args.if_due or not (args.clear_log or args.remove_cron)
     if needs_config and not CONFIG_PATH.exists():

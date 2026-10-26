@@ -102,3 +102,9 @@ Tests: `tests/test_manual_speed.py` covers selection isolation, baseline errors,
 CLI `--get-config` and `--update-config` return JSON; the latter accepts a partial JSON object (up to 64 KiB) on stdin. MCP tools `get_watchdog_config` and `update_watchdog_config` use these fixed commands; patch values never enter shell command text. `tests/test_config_tools.py` checks URL handling, schema matching, validation, preservation, private permissions, atomic failure and CLI locking/redaction. Extended SSH and stdio tests cover the new tools.
 
 Manual speed operations synchronize `benchmark_group` with the concrete current `target_group` member before the first healthcheck. The selection is verified; failed synchronization aborts before measurements. Both CLI and MCP share this path; automatic failover is unchanged.
+
+## Release artifact promotion (1.0.10)
+
+`.github/workflows/build-package.yml` builds IPK/feed for PRs and main pushes only. Tag pushes run a separate `release` job, never the Entware builder. `.github/scripts/select_release_build.py` resolves the checked-out tag commit to a successful completed `push` run of this workflow on `main`, using full SHA matching and paginated run/artifact APIs. Both artifacts must be available and nonexpired in the same run. No other commit or automatic build fallback is allowed.
+
+Release and Pages jobs download immutable artifacts by ID and run ID with `actions: read`. Before release publication, the tag/Makefile/IPK versions, package identity/architecture and feed bytes/checksum/size/compressed metadata are verified. Pages downloads the same selected feed after release succeeds. Existing manual feed republication is unchanged. `tests/test_release_workflow.py` covers selection, pagination, missing/expired artifacts, tag job wiring and actual payload verification scripts using local IPK fixtures.

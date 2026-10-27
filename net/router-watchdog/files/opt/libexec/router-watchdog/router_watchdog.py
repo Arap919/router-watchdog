@@ -1062,6 +1062,36 @@ def manual_speed(
     }
 
 
+def select_node(cfg: dict[str, Any], node: str, expected_current: str) -> dict[str, Any]:
+    """Select an explicitly requested eligible node; caller holds the shared lock."""
+    if not all(isinstance(value, str) and value.strip() for value in (node, expected_current)):
+        raise ValueError("node and expected_current must be nonempty strings")
+    cfg = validate_config(cfg)
+    client = Mihomo(cfg["controller"], cfg.get("secret", ""))
+    group = cfg["target_group"]
+    if current_node(client, group) != expected_current:
+        raise RuntimeError("Target selection changed; run a new comparison")
+    nodes, data = target_candidates(client, group, configured_providers(group))
+    candidate = next((item for item in nodes if item["name"] == node), None)
+    if candidate is None:
+        raise RuntimeError("Requested node is no longer an eligible target member")
+    _, delay = fresh_check(client, candidate, data[candidate["provider"]],
+                           cfg["healthcheck_timeout_ms"])
+    if delay is None:
+        raise RuntimeError("Requested node failed fresh healthcheck")
+    live = client.proxy_group(group)
+    if current_node(client, group) != expected_current:
+        raise RuntimeError("Target selection changed; run a new comparison")
+    if live.get("type") != "Selector" or node not in live.get("all", []):
+        raise RuntimeError("Requested node is no longer an eligible target member")
+    applied = node != expected_current
+    if applied:
+        client.select(group, node)
+    if current_node(client, group) != node:
+        raise RuntimeError("Selection verification failed after switch; inspect current group state")
+    return {"group": group, "applied": applied, "selected_after": node}
+
+
 def sync_cron(entries: list[str]) -> bool:
     changed = remove_legacy_watchdog_entries(CRONTAB_PATH)
     changed = update_managed_crontab(CRONTAB_PATH, entries) or changed
@@ -1137,6 +1167,8 @@ def main() -> int:
                         help="measure selected node through BENCHMARK and return JSON")
     action.add_argument("--find-faster", action="store_true",
                         help="compare selected node with freshly checked candidates; return JSON")
+    action.add_argument("--select-node", action="store_true",
+                        help="select an explicit eligible node using JSON stdin")
     action.add_argument("--get-config", action="store_true",
                         help="return recognized configuration without the secret as JSON")
     action.add_argument("--update-config", action="store_true",
@@ -1146,6 +1178,8 @@ def main() -> int:
     action.add_argument("--install-update", action="store_true",
                         help="install an explicitly requested published version through opkg")
     parser.add_argument("--expected-version", help="with --install-update, require exact X.Y.Z-N")
+    parser.add_argument("--mcp-speed-profile", action="store_true",
+                        help="with report-only measurements, use 10 MB x 4 streams x 1 round")
     parser.add_argument("--apply", action="store_true",
                         help="with --find-faster, apply only a faster winner")
     if any(value in {"-h", "--help"} for value in sys.argv[1:]):
@@ -1156,7 +1190,10 @@ def main() -> int:
         help="with --clear-log, clear only after configured log_cleanup_days",
     )
     args = parser.parse_args()
-    machine = args.measure_selected or args.find_faster or args.get_config or args.update_config
+    machine = (args.measure_selected or args.find_faster or args.get_config
+               or args.update_config or args.select_node)
+    if args.mcp_speed_profile and (not (args.measure_selected or args.find_faster) or args.apply):
+        parser.error("--mcp-speed-profile requires a report-only measurement action")
     if args.apply and not args.find_faster:
         parser.error("--apply requires --find-faster")
     if args.if_due and not args.clear_log:
@@ -1228,9 +1265,23 @@ def main() -> int:
             result = update_config(cfg, json.loads(patch_text))
             print(json.dumps(result, ensure_ascii=False, allow_nan=False))
             return 0
+        if args.select_node:
+            request_text = sys.stdin.read(65537)
+            if len(request_text) > 65536:
+                raise ValueError("Selection request exceeds 64 KiB")
+            request = json.loads(request_text)
+            if not isinstance(request, dict) or set(request) != {"node", "expected_current"}:
+                raise ValueError("Selection requires node and expected_current only")
+            with contextlib.redirect_stdout(sys.stderr):
+                result = select_node(cfg, request["node"], request["expected_current"])
+            print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+            return 0
         if machine:
             with contextlib.redirect_stdout(sys.stderr):
-                result = manual_speed(cfg, find_faster=args.find_faster, apply=args.apply)
+                measurement_cfg = ({**cfg, "download_bytes": 10_000_000,
+                                    "parallel_streams": 4, "multi_rounds": 1}
+                                   if args.mcp_speed_profile else cfg)
+                result = manual_speed(measurement_cfg, find_faster=args.find_faster, apply=args.apply)
             print(json.dumps(result, ensure_ascii=False, allow_nan=False))
             return 0
         choose_and_apply(cfg)

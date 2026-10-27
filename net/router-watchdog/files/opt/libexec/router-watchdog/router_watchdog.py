@@ -50,7 +50,7 @@ DEFAULT_SPEED_TEST_URL = "https://speed.cloudflare.com/__down?bytes={bytes}&cach
 CONFIG_FIELDS = frozenset({
     "controller", "secret", "target_group", "benchmark_group", "benchmark_proxy",
     "top_n", "healthcheck_parallelism", "healthcheck_timeout_ms",
-    "speed_connect_timeout_seconds", "switch_wait_seconds", "speed_test_url",
+    "speed_connect_timeout_seconds", "switch_wait_seconds", "speed_test_provider",
     "download_bytes", "parallel_streams", "multi_rounds", "log_cleanup_days", "schedule",
 })
 
@@ -645,7 +645,7 @@ def download_url(template: str, size: int) -> str:
             raise ValueError
         parsed.port
     except (ValueError, TypeError, KeyError, IndexError):
-        raise ValueError("speed_test_url must be an HTTP(S) URL using only {bytes} and {cache_bust}") from None
+        raise ValueError("Cloudflare download template must be an HTTP(S) URL using only {bytes} and {cache_bust}") from None
     return url
 
 
@@ -677,6 +677,7 @@ def _download(
 SPEED_ERROR_CODES = frozenset({
     "download_timeout", "download_http_error", "download_network_error",
     "download_incomplete", "download_failed",
+    "speedtest_unavailable", "speedtest_timeout", "speedtest_failed", "speedtest_invalid_result",
 })
 
 
@@ -749,6 +750,42 @@ def median(values: list[float]) -> float:
     return (ordered[middle - 1] + ordered[middle]) / 2
 
 
+def measure_speedtest(proxy: str) -> float:
+    """Use speedtest-go's automatic server selection through the benchmark proxy.
+
+    JSON dl_speed is bytes per second, independent of human display units.
+    The optional client is installed separately as /opt/bin/speedtest-go.
+    """
+    try:
+        result = subprocess.run(
+            ["/opt/bin/speedtest-go", "--proxy=" + proxy, "--ping-mode=http",
+             "--no-upload", "--json"],
+            capture_output=True, text=True, check=False, timeout=180,
+        )
+    except FileNotFoundError:
+        raise SpeedTestError("speedtest_unavailable") from None
+    except subprocess.TimeoutExpired:
+        raise SpeedTestError("speedtest_timeout") from None
+    except OSError:
+        raise SpeedTestError("speedtest_failed") from None
+    if result.returncode != 0:
+        raise SpeedTestError("speedtest_failed")
+    try:
+        payload = json.loads(result.stdout)
+        servers = payload["servers"]
+        if not isinstance(servers, list) or len(servers) != 1:
+            raise ValueError
+        speed = servers[0]["dl_speed"]
+        if isinstance(speed, bool) or not isinstance(speed, (int, float)) or speed <= 0:
+            raise ValueError
+        mbps = speed * 8 / 1_000_000
+        if not math.isfinite(mbps):
+            raise ValueError
+    except (ValueError, TypeError, KeyError, IndexError, OverflowError):
+        raise SpeedTestError("speedtest_invalid_result") from None
+    return mbps
+
+
 def measure_speed(client: Mihomo, cfg: dict[str, Any], node: str) -> float:
     timeout = number(cfg, "speed_connect_timeout_seconds", 1, 30)
     group = str(cfg.get("benchmark_group", "BENCHMARK"))
@@ -759,6 +796,14 @@ def measure_speed(client: Mihomo, cfg: dict[str, Any], node: str) -> float:
     time.sleep(float(cfg.get("switch_wait_seconds", 0.7)))
 
     proxy = str(cfg["benchmark_proxy"])
+    provider = cfg.get("speed_test_provider", "cloudflare")
+    if provider == "speedtest":
+        log(f"Speedtest automatic server measurement: {node}.")
+        speed = measure_speedtest(proxy)
+        log(f"Speedtest: {node}, {speed:.2f} Mbps.")
+        return speed
+    if provider != "cloudflare":
+        raise ValueError("speed_test_provider must be cloudflare or speedtest")
     size = number(cfg, "download_bytes", 1_000_000, 200_000_000)
     streams = number(cfg, "parallel_streams", 1, 8)
     rounds = number(cfg, "multi_rounds", 1, 4)
@@ -769,7 +814,7 @@ def measure_speed(client: Mihomo, cfg: dict[str, Any], node: str) -> float:
         started = time.monotonic()
         with ThreadPoolExecutor(max_workers=streams) as pool:
             received = sum(
-                pool.map(lambda _: download(proxy, size, timeout, cfg.get("speed_test_url", DEFAULT_SPEED_TEST_URL)), range(streams))
+                pool.map(lambda _: download(proxy, size, timeout, DEFAULT_SPEED_TEST_URL), range(streams))
             )
         elapsed = time.monotonic() - started
         speed = received * 8 / elapsed / 1_000_000
@@ -807,10 +852,11 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "top_n": 7, "healthcheck_parallelism": 6, "healthcheck_timeout_ms": 5000,
         "speed_connect_timeout_seconds": 5, "switch_wait_seconds": 0.7,
         "download_bytes": 25000000, "parallel_streams": 4, "multi_rounds": 2,
-        "log_cleanup_days": 3, "speed_test_url": DEFAULT_SPEED_TEST_URL,
+        "log_cleanup_days": 3, "speed_test_provider": "cloudflare",
     }
     result = {**defaults, **cfg}
-    download_url(result["speed_test_url"], 1_000_000)
+    if result["speed_test_provider"] not in ("cloudflare", "speedtest"):
+        raise ValueError("speed_test_provider must be cloudflare or speedtest")
     for key in ("controller", "target_group", "benchmark_group", "benchmark_proxy"):
         value = result.get(key)
         if not isinstance(value, str) or not value.strip():

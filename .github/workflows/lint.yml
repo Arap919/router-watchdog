@@ -16,7 +16,9 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Check Python syntax
-        run: python3 -m py_compile net/router-watchdog/files/opt/libexec/router-watchdog/router_watchdog.py net/router-watchdog/files/opt/libexec/router-watchdog/merge_config.py
+        run: |
+          python3 -m py_compile net/router-watchdog/files/opt/libexec/router-watchdog/router_watchdog.py net/router-watchdog/files/opt/libexec/router-watchdog/merge_config.py net/router-watchdog/files/opt/libexec/router-watchdog/update_service.py scripts/build_package.py .github/scripts/select_release_build.py
+          sh -n install.sh
 
       - name: Install YAML parser
         run: python3 -m pip install PyYAML==6.0.3

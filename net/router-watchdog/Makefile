@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=router-watchdog
-PKG_VERSION:=1.0.10
+PKG_VERSION:=1.0.11
 PKG_RELEASE:=1
 PKG_MAINTAINER:=Arap919
 PKG_LICENSE:=MIT
@@ -13,7 +13,7 @@ define Package/router-watchdog
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Mihomo provider failover watchdog
-  DEPENDS:=+python3 +python3-yaml +ca-bundle
+  DEPENDS:=+python3 +python3-yaml +ca-bundle +wget-ssl
   PKGARCH:=all
 endef
 
@@ -61,6 +61,7 @@ define Package/router-watchdog/install
 
 	$(INSTALL_BIN) ./files/opt/bin/router-watchdog $(1)/opt/bin/router-watchdog
 	$(INSTALL_BIN) ./files/opt/libexec/router-watchdog/router_watchdog.py $(1)/opt/libexec/router-watchdog/router_watchdog.py
+	$(INSTALL_BIN) ./files/opt/libexec/router-watchdog/update_service.py $(1)/opt/libexec/router-watchdog/update_service.py
 	$(INSTALL_BIN) ./files/opt/libexec/router-watchdog/merge_config.py $(1)/opt/libexec/router-watchdog/merge_config.py
 	$(INSTALL_DATA) ./files/opt/etc/router-watchdog.json $(1)/opt/share/router-watchdog/defaults.json
 	# Keep legacy ownership through unpack; do not register this as a conffile.

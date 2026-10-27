@@ -12,3 +12,5 @@ feed/
 *.key
 credentials.json
 secrets/
+
+/dist/

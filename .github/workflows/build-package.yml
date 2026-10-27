@@ -30,362 +30,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Prepare Entware builder
-        run: |
-          set -eux
-
-          rm -rf entware-docker
-
-          git clone --depth 1 \
-            https://github.com/Entware/docker.git \
-            entware-docker
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("entware-docker/Dockerfile")
-          text = path.read_text()
-          needle = "USER me"
-          if text.count(needle) != 1:
-              raise SystemExit("Expected Entware Dockerfile USER section was not found")
-
-          python2 = """RUN curl -fL https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tar.xz -o /tmp/Python-2.7.18.tar.xz && \\
-              echo 'b62c0e7937551d0cc02b8fd5cb0f544f9405bafc9a54d3808ed4594812edef43  /tmp/Python-2.7.18.tar.xz' | sha256sum -c - && \\
-              tar -xJf /tmp/Python-2.7.18.tar.xz -C /tmp && \\
-              cd /tmp/Python-2.7.18 && \\
-              ./configure --prefix=/opt/python2 --with-ensurepip=no && \\
-              make -j2 && make altinstall && \\
-              ln -s python2.7 /opt/python2/bin/python2 && \\
-              /opt/python2/bin/python2 --version && \\
-              rm -rf /tmp/Python-2.7.18 /tmp/Python-2.7.18.tar.xz
-          ENV PATH="/opt/python2/bin:$PATH"
-
-          """
-          path.write_text(text.replace(needle, python2 + needle, 1))
-          PY
-
-          docker build \
-            --pull \
-            --tag entware-builder \
-            ./entware-docker
-
-      - name: Resolve Entware feed revisions
-        id: entware-revisions
+      - name: Build package and feed
+        env:
+          SOURCE_DATE_EPOCH: "0"
         run: |
           set -euo pipefail
-
-          entware=$(git ls-remote https://github.com/Entware/Entware.git HEAD | cut -f1)
-          packages=$(git ls-remote https://github.com/Entware/entware-packages.git HEAD | cut -f1)
-          rustlang=$(git ls-remote https://github.com/Entware/entware-rust.git HEAD | cut -f1)
-
-          test -n "$entware"
-          test -n "$packages"
-          test -n "$rustlang"
-
-          echo "entware=$entware" >> "$GITHUB_OUTPUT"
-          echo "packages=$packages" >> "$GITHUB_OUTPUT"
-          echo "rustlang=$rustlang" >> "$GITHUB_OUTPUT"
-
-      - name: Restore Entware build cache
-        id: entware-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: entware-cache.tar
-          key: ${{ runner.os }}-entware-x64-3.2-${{ steps.entware-revisions.outputs.entware }}-${{ steps.entware-revisions.outputs.packages }}-${{ steps.entware-revisions.outputs.rustlang }}-${{ hashFiles('net/router-watchdog/Makefile', 'net/router-watchdog/files/**') }}
-          restore-keys: |
-            ${{ runner.os }}-entware-x64-3.2-${{ steps.entware-revisions.outputs.entware }}-${{ steps.entware-revisions.outputs.packages }}-${{ steps.entware-revisions.outputs.rustlang }}-
-
-      - name: Create Entware build script
-        run: |
-          set -eux
-
-          cat > build-entware.sh <<'SCRIPT'
-          #!/bin/bash
-
-          set -euxo pipefail
-
-          echo "=== Start Entware build ==="
-
-          cd /home/me
-
-          rm -rf Entware
-
-          echo "=== Clone Entware ==="
-
-          git clone --depth 1 \
-            https://github.com/Entware/Entware.git \
-            Entware
-
-          cd Entware
-
-          save_build_cache() {
-            build_status=$?
-            trap - EXIT
-
-            echo "=== Save Entware build cache archive ==="
-
-            if tar -cf /workspace/entware-cache.tar \
-              build_dir staging_dir dl; then
-              chmod 644 /workspace/entware-cache.tar
-            else
-              echo "Failed to create Entware build cache archive" >&2
-              exit 1
-            fi
-
-            exit "$build_status"
-          }
-
-          trap save_build_cache EXIT
-
-          if [ -f /workspace/entware-cache.tar ]; then
-            echo "=== Restore Entware build cache archive ==="
-            tar -xf /workspace/entware-cache.tar
-          fi
-
-          echo "=== Entware revision ==="
-
-          git rev-parse HEAD
-
-          echo "=== Configure target ==="
-
-          cp configs/x64-3.2.config .config
-
-          echo "=== Add local router-watchdog feed ==="
-
-          echo 'src-link router_watchdog /workspace/net' >> feeds.conf
-
-          echo "=== feeds.conf ==="
-
-          nl -ba feeds.conf
-
-          echo "=== Update router-watchdog feed ==="
-
-          ./scripts/feeds update router_watchdog
-
-          echo "=== Install router-watchdog package definition ==="
-
-          ./scripts/feeds install -p router_watchdog router-watchdog
-
-          echo "=== Update packages feed ==="
-
-          ./scripts/feeds update packages
-
-          echo "=== Update rustlang feed ==="
-
-          ./scripts/feeds update rustlang
-
-          echo "=== Install python3 package definition ==="
-
-          ./scripts/feeds install python3
-
-          echo "=== Verify package symlink ==="
-
-          test -L package/feeds/router_watchdog/router-watchdog
-
-          ls -la package/feeds/router_watchdog/router-watchdog
-
-          echo "=== Enable router-watchdog ==="
-
-          echo "CONFIG_PACKAGE_router-watchdog=m" >> .config
-
-          echo "=== Run defconfig ==="
-
-          make defconfig
-
-          echo "=== Verify package configuration ==="
-
-          grep '^CONFIG_PACKAGE_router-watchdog=' .config
-
-          echo "=== Build router-watchdog ==="
-
-          echo "=== Build Entware host tools ==="
-
-          export FORCE_UNSAFE_CONFIGURE=1
-
-          make -j1 tools/tar/compile V=s
-
-          echo "=== Install Entware host tools ==="
-
-          make -j"$(nproc)" tools/install
-
-          echo "=== Build Entware toolchain ==="
-
-          make -j"$(nproc)" toolchain/install
-
-          make package/router-watchdog/compile V=s
-
-          echo "=== Find generated package ==="
-
-          package=$(find bin \
-            -type f \
-            -name 'router-watchdog_*.ipk' \
-            -print \
-            -quit)
-
-          echo "Selected package: [$package]"
-
-          test -n "$package"
-
-          echo "=== Copy package to workspace ==="
-
-          mkdir -p /workspace/dist
-
-          cp "$package" /workspace/dist/
-
-          echo "=== Generated package ==="
-
-          ls -lh /workspace/dist/
-
-          echo "=== Entware build completed successfully ==="
-          SCRIPT
-
-          chmod +x build-entware.sh
-
-          echo "=== Build script ==="
-          cat build-entware.sh
-
-      - name: Build .ipk
-        run: |
-          set -eux
-
-          mkdir -p dist
-
-          docker run --rm \
-            --user root \
-            -e GITHUB_WORKSPACE=/workspace \
-            -v "$GITHUB_WORKSPACE:/workspace" \
-            entware-builder \
-            bash -euxo pipefail /workspace/build-entware.sh
-
-      - name: Save Entware build cache
-        if: always() && steps.entware-cache.outputs.cache-matched-key == ''
-        uses: actions/cache/save@v4
-        with:
-          path: entware-cache.tar
-          key: ${{ runner.os }}-entware-x64-3.2-${{ steps.entware-revisions.outputs.entware }}-${{ steps.entware-revisions.outputs.packages }}-${{ steps.entware-revisions.outputs.rustlang }}-${{ hashFiles('net/router-watchdog/Makefile', 'net/router-watchdog/files/**') }}
-
-      - name: Verify package
-        run: |
-          set -eux
-
-          echo "=== Package files ==="
-
-          ls -lh dist/
-
-          package_count=$(find dist \
-            -maxdepth 1 \
-            -type f \
-            -name '*.ipk' \
-            | wc -l)
-
-          test "$package_count" -eq 1
-
-          package=$(find dist \
-            -maxdepth 1 \
-            -type f \
-            -name '*.ipk' \
-            -print \
-            -quit)
-
-          echo "Package: $package"
-
-          echo "=== IPK archive ==="
-
-          tar -tzf "$package"
-
-          echo "=== Package control metadata ==="
-
-          tar -xOzf "$package" ./control.tar.gz \
-            | tar -xOzf - ./control
-
-      - name: Build feed
-        run: |
-          set -eux
-
-          rm -rf feed
-
-          mkdir -p feed/all
-
-          cp dist/*.ipk feed/all/
-
-          package=$(find feed/all \
-            -maxdepth 1 \
-            -type f \
-            -name '*.ipk' \
-            -print \
-            -quit)
-
-          filename=$(basename "$package")
-
-          sha256=$(sha256sum "$package" | awk '{print $1}')
-
-          size=$(stat -c '%s' "$package")
-
-          control=$(mktemp)
-
-          tar -xOzf "$package" ./control.tar.gz \
-            | tar -xOzf - ./control \
-            > "$control"
-
-          cat "$control" > feed/all/Packages
-
-          printf 'Filename: %s\n' \
-            "$filename" \
-            >> feed/all/Packages
-
-          printf 'Size: %s\n' \
-            "$size" \
-            >> feed/all/Packages
-
-          printf 'SHA256sum: %s\n\n' \
-            "$sha256" \
-            >> feed/all/Packages
-
-          rm -f "$control"
-
-          gzip -9 -c \
-            feed/all/Packages \
-            > feed/all/Packages.gz
-
-          cp README.md feed/README.md
-
-          echo "=== Feed contents ==="
-
-          find feed \
-            -maxdepth 2 \
-            -type f \
-            -print
-
-          echo "=== Packages ==="
-
-          cat feed/all/Packages
-
-      - name: Verify feed metadata
-        run: |
-          set -eux
-
-          gzip -t feed/all/Packages.gz
-
-          grep -E '^Package: router-watchdog$' \
-            feed/all/Packages
-
-          grep -E '^Architecture: all$' \
-            feed/all/Packages
-
-          grep -E '^Filename: router-watchdog_' \
-            feed/all/Packages
-
-          grep -E '^Size: [0-9]+$' \
-            feed/all/Packages
-
-          grep -E '^SHA256sum: [0-9a-f]{64}$' \
-            feed/all/Packages
+          python3 scripts/build_package.py
+          sh -n install.sh
+          cp install.sh dist/install.sh
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v6
         with:
           name: router-watchdog-ipk
-          path: dist/*.ipk
+          path: |
+            dist/*.ipk
+            dist/install.sh
           if-no-files-found: error
 
       - name: Upload feed artifact
@@ -458,6 +118,7 @@ jobs:
           import gzip
           import hashlib
           import io
+          import json
           import os
           import re
           import tarfile
@@ -505,13 +166,32 @@ jobs:
           require(metadata.get('Size') == str(package.stat().st_size), 'Feed size mismatch')
           require(gzip.decompress((feed / 'Packages.gz').read_bytes()) == metadata_bytes,
                   'Compressed feed metadata mismatch')
+          manifest = json.loads(Path('feed/update.json').read_text())
+          require(type(manifest.get('schema_version')) is int and manifest['schema_version'] == 1,
+                  'Unsupported update manifest schema')
+          require(manifest.get('latest_version') == control['Version'], 'Manifest version mismatch')
+          require(manifest.get('package_url') ==
+                  'https://arap919.github.io/router-watchdog/all/' + package.name,
+                  'Manifest package URL mismatch')
+          require(manifest.get('sha256') == hashlib.sha256(package.read_bytes()).hexdigest(),
+                  'Manifest checksum mismatch')
+          require(type(manifest.get('size')) is int and manifest['size'] == package.stat().st_size,
+                  'Manifest size mismatch')
+          require(manifest.get('release_url') ==
+                  'https://github.com/Arap919/router-watchdog/releases/tag/v' + version,
+                  'Manifest release URL mismatch')
+          require(isinstance(manifest.get('release_notes'), str), 'Invalid manifest release notes')
           print('Verified existing IPK and feed for ' + os.environ['GITHUB_REF_NAME'])
           PYVERIFY
+          test -f dist/install.sh
+          sh -n dist/install.sh
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.ipk
+          files: |
+            dist/*.ipk
+            dist/install.sh
 
   publish-feed:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -586,34 +266,12 @@ jobs:
           test "$(find dist -maxdepth 1 -type f -name 'router-watchdog_*.ipk' | wc -l)" -eq 1
 
       - name: Build corrected feed
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-
           package=$(find dist -maxdepth 1 -type f -name 'router-watchdog_*.ipk' -print -quit)
-          filename=$(basename "$package")
-          sha256=$(sha256sum "$package" | awk '{print $1}')
-          size=$(stat -c '%s' "$package")
-          control=$(mktemp)
-
-          mkdir -p feed/all
-
-          tar -xOzf "$package" ./control.tar.gz \
-            | tar -xOzf - ./control \
-            > "$control"
-
-          cp "$package" feed/all/
-          cat "$control" > feed/all/Packages
-          printf 'Filename: %s\nSize: %s\nSHA256sum: %s\n\n' \
-            "$filename" "$size" "$sha256" \
-            >> feed/all/Packages
-          rm -f "$control"
-
-          gzip -9 -c feed/all/Packages > feed/all/Packages.gz
-          cp README.md feed/README.md
-
-          grep -E '^Package: router-watchdog$' feed/all/Packages
-          grep -E '^Filename: router-watchdog_' feed/all/Packages
-          gzip -t feed/all/Packages.gz
+          python3 scripts/build_package.py --feed-only "$package" --release-tag "$RELEASE_TAG"
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v4

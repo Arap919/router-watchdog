@@ -208,7 +208,7 @@ def build_server():
         Use field names from get_watchdog_config.editable_fields. The router rejects
         unknown fields, invalid types, ranges, URLs and nested schedule keys before
         any write. Unspecified settings are preserved. No arbitrary path is accepted.
-        speed_test_url accepts HTTP(S) with optional {bytes} and {cache_bust} tokens.
+        speed_test_provider accepts only cloudflare or speedtest.
         schedule replaces the complete schedule object: windows with start/end in
         HH:MM and integer every_minutes 1..1440. cron_sync_required means the JSON
         was saved but cron still needs separate synchronization. Uses shared lock.

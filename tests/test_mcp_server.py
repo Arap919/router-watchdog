@@ -116,11 +116,11 @@ class TestMCPBridge(unittest.TestCase):
 
 
     def test_config_patch_is_stdin_not_remote_command(self):
-        changes = {'speed_test_url': 'https://example.com/file?q=$(do-not-run)', 'top_n': 3}
+        changes = {'speed_test_provider': 'speedtest', 'target_group': 'group-$(do-not-run)', 'top_n': 3}
         self.run.return_value = subprocess.CompletedProcess([], 0,
-            '{"updated_fields":["speed_test_url","top_n"],"cron_sync_required":false}', '')
+            '{"updated_fields":["speed_test_provider","top_n"],"cron_sync_required":false}', '')
         result = self.module.call_watchdog('update', changes=changes)
-        self.assertEqual(result['updated_fields'], ['speed_test_url', 'top_n'])
+        self.assertEqual(result['updated_fields'], ['speed_test_provider', 'top_n'])
         self.assertEqual(self.run.call_args.args[0][-1], '/opt/bin/router-watchdog --update-config')
         self.assertEqual(json.loads(self.run.call_args.kwargs['input']), changes)
         self.assertNotIn('do-not-run', self.run.call_args.args[0][-1])

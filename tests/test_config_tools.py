@@ -21,17 +21,17 @@ class TestSpeedService(unittest.TestCase):
 
     def test_editable_fields_match_packaged_schema(self):
         self.assertTrue(hasattr(module, 'CONFIG_FIELDS'))
-        self.assertEqual(set(module.CONFIG_FIELDS), set(DEFAULT_CONFIG))
+        self.assertEqual(set(module.CONFIG_FIELDS), set(DEFAULT_CONFIG) - {'_comment_speed_test_provider'})
 
-    def test_measure_speed_forwards_custom_service(self):
-        cfg = {**self.cfg, 'speed_test_url': 'https://example.com/custom',
+    def test_measure_speed_uses_cloudflare_constant(self):
+        cfg = {**self.cfg, 'speed_test_provider': 'cloudflare',
                'parallel_streams': 1, 'multi_rounds': 1, 'switch_wait_seconds': 0}
         with (mock.patch.object(module, 'download', return_value=1000000) as download,
               mock.patch.object(module, 'log'), mock.patch.object(module.time, 'sleep'),
               mock.patch.object(module.time, 'monotonic', side_effect=[0, 1])):
             module.measure_speed(mock.Mock(), cfg, 'node')
         download.assert_called_once_with(cfg['benchmark_proxy'], cfg['download_bytes'],
-                                         cfg['speed_connect_timeout_seconds'], cfg['speed_test_url'])
+                                         cfg['speed_connect_timeout_seconds'], module.DEFAULT_SPEED_TEST_URL)
 
     def test_download_has_no_total_duration_limit(self):
         result = module.subprocess.CompletedProcess([], 0, '1000000', '')
@@ -85,8 +85,8 @@ class TestSpeedService(unittest.TestCase):
             self.assertNotIn('private', str(raised.exception))
 
     def test_default_is_configurable(self):
-        self.assertIn('speed_test_url', module.validate_config(self.cfg))
-        self.assertIn('speed_test_url', DEFAULT_CONFIG)
+        self.assertEqual(module.validate_config(self.cfg)['speed_test_provider'], 'cloudflare')
+        self.assertIn('speed_test_provider', DEFAULT_CONFIG)
 
     def test_download_renders_template_and_keeps_query(self):
         response = mock.MagicMock()
@@ -109,11 +109,71 @@ class TestSpeedService(unittest.TestCase):
                  'https://example.com/file#fragment', 'https://example.com/white space']
         for url in cases:
             with self.subTest(url=url), self.assertRaises(ValueError):
-                module.validate_config({**self.cfg, 'speed_test_url': url})
+                module.download_url(url, 1000000)
 
-    def test_static_service_url_is_valid(self):
-        cfg = module.validate_config({**self.cfg, 'speed_test_url': 'https://example.com/large.bin'})
-        self.assertEqual(cfg['speed_test_url'], 'https://example.com/large.bin')
+    def test_provider_accepts_only_two_exact_values(self):
+        for value in ('speedtest', 'cloudflare'):
+            self.assertEqual(module.validate_config({**self.cfg, 'speed_test_provider': value})['speed_test_provider'], value)
+        for value in ('', None, True, [], {}, 'SPEEDTEST', 'other'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                module.validate_config({**self.cfg, 'speed_test_provider': value})
+
+    def test_legacy_url_is_not_editable(self):
+        self.assertNotIn('speed_test_url', module.CONFIG_FIELDS)
+        self.assertNotIn('_comment_speed_test_provider', module.CONFIG_FIELDS)
+
+    def test_speedtest_selects_benchmark_and_converts_bytes_per_second(self):
+        cfg = {**self.cfg, 'speed_test_provider': 'speedtest', 'switch_wait_seconds': 0}
+        client = mock.Mock()
+        response = module.subprocess.CompletedProcess([], 0, json.dumps({
+            'servers': [{'id': '6691', 'dl_speed': 12500000}]}), '')
+        events = []
+        client.select.side_effect = lambda *args: events.append('select')
+        with (mock.patch.object(module.subprocess, 'run', return_value=response) as run,
+              mock.patch.object(module, 'download') as download,
+              mock.patch.object(module, 'log'), mock.patch.object(module.time, 'sleep')):
+            run.side_effect = lambda *args, **kwargs: (events.append('run') or response)
+            self.assertEqual(module.measure_speed(client, cfg, 'node'), 100)
+        self.assertEqual(events, ['select', 'run'])
+        client.select.assert_called_once_with('BENCHMARK', 'node', cfg['speed_connect_timeout_seconds'])
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], '/opt/bin/speedtest-go')
+        self.assertIn('--proxy=' + cfg['benchmark_proxy'], command)
+        self.assertIn('--no-upload', command)
+        self.assertIn('--json', command)
+        self.assertIn('--ping-mode=http', command)
+        self.assertNotIn('--list', command)
+        self.assertFalse(any(arg.startswith('--server') for arg in command))
+        self.assertFalse(run.call_args.kwargs.get('shell', False))
+        self.assertGreater(run.call_args.kwargs['timeout'], 0)
+        download.assert_not_called()
+
+    def test_speedtest_rejects_failed_or_invalid_results(self):
+        cfg = {**self.cfg, 'speed_test_provider': 'speedtest'}
+        payloads = ['not json', '{}', '[]', '{"servers":[]}',
+                    '{"servers":[{}]}', '{"servers":[{"dl_speed":0}]}',
+                    '{"servers":[{"dl_speed":-1}]}', '{"servers":[{"dl_speed":true}]}',
+                    '{"servers":[{"dl_speed":"100"}]}',
+                    '{"servers":[{"dl_speed":NaN}]}',
+                    '{"servers":[{"dl_speed":Infinity}]}']
+        results = [module.subprocess.CompletedProcess([], 0, payload, 'private') for payload in payloads]
+        results.append(module.subprocess.CompletedProcess([], 1, 'private', 'private'))
+        for result in results:
+            with (self.subTest(result=result),
+                  mock.patch.object(module.subprocess, 'run', return_value=result),
+                  mock.patch.object(module, 'log'), mock.patch.object(module.time, 'sleep'),
+                  self.assertRaises(module.SpeedTestError) as raised):
+                module.measure_speed(mock.Mock(), cfg, 'node')
+            self.assertNotIn('private', str(raised.exception))
+
+    def test_speedtest_missing_binary_and_timeout_are_sanitized(self):
+        cfg = {**self.cfg, 'speed_test_provider': 'speedtest'}
+        for error in (FileNotFoundError('private'), module.subprocess.TimeoutExpired('private', 180)):
+            with (mock.patch.object(module.subprocess, 'run', side_effect=error),
+                  mock.patch.object(module, 'log'), mock.patch.object(module.time, 'sleep'),
+                  self.assertRaises(module.SpeedTestError) as raised):
+                module.measure_speed(mock.Mock(), cfg, 'node')
+            self.assertNotIn('private', str(raised.exception))
 
 
 class TestConfigTools(unittest.TestCase):
@@ -148,7 +208,8 @@ class TestConfigTools(unittest.TestCase):
                  {'schedule': {'windows': [], 'command': 'evil'}},
                  {'schedule': {'windows': [{'start':'07:00','end':'08:00',
                                             'every_minutes':1,'command':'evil'}]}},
-                 {'switch_wait_seconds': float('inf')}, [], {}]
+                 {'switch_wait_seconds': float('inf')}, {'speed_test_provider': 'other'},
+                 {'speed_test_url': 'https://example.com/file'}, [], {}]
         original = self.path.read_bytes()
         for changes in cases:
             with self.subTest(changes=changes), self.assertRaises(ValueError):
@@ -167,7 +228,7 @@ class TestConfigTools(unittest.TestCase):
         self.assertNotIn('secret', result['config'])
         self.assertNotIn('old_custom_field', result['config'])
         self.assertTrue(result['secret_configured'])
-        self.assertIn('speed_test_url', result['editable_fields'])
+        self.assertIn('speed_test_provider', result['editable_fields'])
         self.assertIn('secret', result['editable_fields'])
         self.assertNotIn('private-value', json.dumps(result))
 

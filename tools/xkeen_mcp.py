@@ -71,6 +71,17 @@ def call_watchdog(
         payload = None
     if isinstance(payload, dict) and payload.get("error") == "busy":
         raise RuntimeError("Router watchdog is busy; retry after the current operation completes")
+    safe_errors = {
+        "download_timeout": "Speed-test download exceeded its time limit",
+        "download_http_error": "Speed-test service returned an HTTP error",
+        "download_network_error": "Speed-test connection failed",
+        "download_incomplete": "Speed-test service returned insufficient data",
+        "download_failed": "Speed-test download worker failed",
+    }
+    if (isinstance(payload, dict) and isinstance(payload.get("error"), str)
+            and payload["error"] in safe_errors):
+        code = payload["error"]
+        raise RuntimeError(f"{code}: {safe_errors[code]}")
     if response.returncode != 0:
         raise RuntimeError("Router operation failed. Check SSH access, the installed watchdog version, "
                            "BENCHMARK configuration and router logs locally")

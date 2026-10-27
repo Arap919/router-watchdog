@@ -59,7 +59,8 @@ def call_watchdog(
             "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3", "-p", str(port), host, command]
     try:
-        response = subprocess.run(argv, capture_output=True, text=True, timeout=1800, check=False, **options)
+        response = subprocess.run(argv, capture_output=True, text=True, timeout=None if operation in {"measure", "find"} else 1800,
+                                  check=False, **options)
     except subprocess.TimeoutExpired:
         raise RuntimeError("SSH timed out; the router operation may continue holding the shared lock. "
                            "Inspect router state before retrying; do not remove its lock file") from None

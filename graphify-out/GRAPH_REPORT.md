@@ -1,17 +1,17 @@
 # Graph Report - router-watchdog  (2026-10-27)
 
 ## Corpus Check
-- 39 files · ~29,246 words
+- 39 files · ~29,428 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 4 file(s) not represented in the graph (top: (none) 4)
 
 ## Summary
-- 702 nodes · 1250 edges · 49 communities (31 shown, 18 thin omitted)
+- 705 nodes · 1253 edges · 43 communities (26 shown, 17 thin omitted)
 - Extraction: 94% EXTRACTED · 6% INFERRED · 0% AMBIGUOUS · INFERRED: 81 edges (avg confidence: 0.9)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `584773b7`
+- Built from commit: `6ce84e9c`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -49,15 +49,9 @@
 - test.sh
 - release-1.0.10-plan.md
 - TestUpdateService
-- Approved Mihomo failover design
-- README.md
-- Project map
 - TestPackageBuilder
-- Repository agent instructions
-- План реализации failover
 - Быстрая упаковка и обновление watchdog
 - install.sh
-- update_service.py
 - republish-feed
 - contents
 - publish-feed
@@ -72,8 +66,8 @@
 5. `choose_and_apply()` - 19 edges
 6. `TestManualSpeed` - 19 edges
 7. `log()` - 18 edges
-8. `main()` - 16 edges
-9. `TestMCPBridge` - 16 edges
+8. `TestMCPBridge` - 18 edges
+9. `main()` - 16 edges
 10. `measure_speed()` - 15 edges
 
 ## Surprising Connections (you probably didn't know these)
@@ -91,7 +85,7 @@
 ## Import Cycles
 - None detected.
 
-## Communities (49 total, 18 thin omitted)
+## Communities (43 total, 17 thin omitted)
 
 ### Community 0 - "router_watchdog.py"
 Cohesion: 0.08
@@ -102,8 +96,8 @@ Cohesion: 0.08
 Nodes (4): Controller, TestFailover, read(), TestMCPStdio
 
 ### Community 2 - "Controller"
-Cohesion: 0.09
-Nodes (18): atomic_write(), install(), merge(), download(), update_config(), archive(), build_feed(), compressed() (+10 more)
+Cohesion: 0.06
+Nodes (36): main(), get(), pages(), select_build(), atomic_write(), install(), merge(), download() (+28 more)
 
 ### Community 3 - "steps"
 Cohesion: 0.27
@@ -142,8 +136,8 @@ Cohesion: 0.18
 Nodes (11): override-destination, ports, ports, HTTP, QUIC, TLS, sniffer, enable (+3 more)
 
 ### Community 15 - "router-watchdog"
-Cohesion: 0.15
-Nodes (13): Cron и пути, MCP: замер скорости и подбор узла, router-watchdog, Алгоритм, Выпуск из готовой сборки main, Команды, лог и блокировка, Конфигурация watchdog, Лицензия (+5 more)
+Cohesion: 0.05
+Nodes (37): Context entry point, graphify, Language and scope, Repository agent instructions, Security and external actions, Router watchdog context, Test execution approval, Approved Mihomo failover design (+29 more)
 
 ### Community 20 - "listeners"
 Cohesion: 0.29
@@ -166,36 +160,16 @@ Cohesion: 0.35
 Nodes (5): artifacts(), run_record(), TestReleaseSelection, get(), get()
 
 ### Community 25 - "call_watchdog"
-Cohesion: 0.08
-Nodes (31): Configurable speed service and config MCP tools, Задача 1: безопасное отдельное переключение в runtime, Задача 2: разделить MCP-инструменты и обновить документацию, Ограничения, План разделения замера и выбора ноды MCP, Проверки рисков, Codex, MCP для замеров Mihomo (+23 more)
+Cohesion: 0.06
+Nodes (41): Configurable speed service and config MCP tools, Existing defaults, Fast script package and update integration (1.0.11), Implemented behavior and validation limits, Installed paths and cron, Local verification, MCP quick measurement profile, Project map (+33 more)
 
 ### Community 29 - "План реализации MCP для Mihomo"
 Cohesion: 0.40
 Nodes (4): Начальная синхронизация BENCHMARK, План реализации MCP для Mihomo, Расширение: сервис замеров и конфигурация, Результат
 
-### Community 35 - "Approved Mihomo failover design"
-Cohesion: 0.20
-Nodes (10): Approved Mihomo failover design, Benchmark isolation, Implementation rulings and evidence, Log cleanup, Normal run, Primary references, Scope and invariants, Subscription recovery (+2 more)
-
-### Community 37 - "Project map"
-Cohesion: 0.22
-Nodes (9): Existing defaults, Fast script package and update integration (1.0.11), Implemented behavior and validation limits, Installed paths and cron, Local verification, MCP quick measurement profile, Project map, Release artifact promotion (1.0.10) (+1 more)
-
-### Community 39 - "Repository agent instructions"
-Cohesion: 0.29
-Nodes (6): Context entry point, graphify, Language and scope, Repository agent instructions, Security and external actions, Test execution approval
-
-### Community 40 - "План реализации failover"
-Cohesion: 0.33
-Nodes (6): 1. Конфигурация и изоляция замеров, 2. Аварийное восстановление и выбор, 3. Логи, блокировка и cron, 4. Документация и итоговая проверка, План реализации failover, Результат проверки
-
 ### Community 41 - "Быстрая упаковка и обновление watchdog"
 Cohesion: 0.29
 Nodes (6): 1. Быстрый пакет и feed, 2. Установка и CLI обновлений, 3. Проверка и интеграция, Быстрая упаковка и обновление watchdog, Подготовка публикации, Результат локальной проверки
-
-### Community 43 - "update_service.py"
-Cohesion: 0.14
-Nodes (18): main(), get(), pages(), select_build(), check_update(), download_package(), fetch_manifest(), install_update() (+10 more)
 
 ### Community 44 - "republish-feed"
 Cohesion: 0.22
@@ -218,22 +192,22 @@ Cohesion: 0.33
 Nodes (6): release, feed_artifact_id, source_run_id, if, outputs, runs-on
 
 ## Knowledge Gaps
-- **18 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **17 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `Project map` connect `Project map` to `router_watchdog.py`, `call_watchdog`, `README.md`?**
+- **Why does `Project map` connect `call_watchdog` to `router_watchdog.py`, `router-watchdog`?**
   _High betweenness centrality (0.065) - this node is a cross-community bridge._
 - **Should `router_watchdog.py` be split into smaller, more focused modules?**
   _Cohesion score 0.08438818565400844 - nodes in this community are weakly interconnected._
-- **Why does `Configurable speed service and config MCP tools` connect `call_watchdog` to `router_watchdog.py`, `Controller`, `Project map`?**
+- **Why does `Configurable speed service and config MCP tools` connect `call_watchdog` to `router_watchdog.py`, `Controller`?**
   _High betweenness centrality (0.052) - this node is a cross-community bridge._
 - **Should `with` be split into smaller, more focused modules?**
   _Cohesion score 0.07536231884057971 - nodes in this community are weakly interconnected._
 - **Why does `update_config()` connect `Controller` to `router_watchdog.py`, `call_watchdog`?**
   _High betweenness centrality (0.049) - this node is a cross-community bridge._
 - **Should `Controller` be split into smaller, more focused modules?**
-  _Cohesion score 0.09307244843997885 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.06287985039738195 - nodes in this community are weakly interconnected._
 - **Should `Approved Mihomo failover design` be split into smaller, more focused modules?**
   _Cohesion score 0.11688311688311688 - nodes in this community are weakly interconnected._

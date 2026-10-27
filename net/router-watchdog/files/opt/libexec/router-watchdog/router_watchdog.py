@@ -674,7 +674,6 @@ def _download(
     return received
 
 
-DOWNLOAD_DEADLINE_SECONDS = 60
 SPEED_ERROR_CODES = frozenset({
     "download_timeout", "download_http_error", "download_network_error",
     "download_incomplete", "download_failed",
@@ -702,7 +701,7 @@ def download_error_code(exc: Exception) -> str:
     return "download_failed"
 
 
-# A separate interpreter provides a hard deadline even while headers/body trickle.
+# A separate interpreter isolates download failures without a total time limit.
 # Pass connection details over stdin; never include URLs in process arguments.
 _DOWNLOAD_WORKER = """
 import json, runpy, sys
@@ -724,7 +723,7 @@ def download(
         result = subprocess.run(
             [sys.executable, "-c", _DOWNLOAD_WORKER, str(Path(__file__).resolve())],
             input=json.dumps([proxy, bytes_to_get, connect_timeout, url_template]),
-            capture_output=True, text=True, timeout=DOWNLOAD_DEADLINE_SECONDS,
+            capture_output=True, text=True,
             check=False,
         )
     except subprocess.TimeoutExpired:

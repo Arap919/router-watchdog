@@ -37,6 +37,18 @@ class TestMCPBridge(unittest.TestCase):
         self.module.call_watchdog('find')
         self.assertEqual(self.run.call_args.args[0][-1], '/opt/bin/router-watchdog --find-faster --mcp-speed-profile')
 
+    def test_measurements_have_no_ssh_duration_limit(self):
+        for operation in ('measure', 'find'):
+            with self.subTest(operation=operation):
+                self.module.call_watchdog(operation)
+                self.assertIsNone(self.run.call_args.kwargs.get('timeout'))
+
+    def test_other_operations_keep_ssh_duration_limit(self):
+        self.run.return_value = subprocess.CompletedProcess([], 0,
+            '{"config":{},"editable_fields":[],"secret_configured":false}', '')
+        self.module.call_watchdog('get')
+        self.assertEqual(self.run.call_args.kwargs['timeout'], 1800)
+
     def test_select_denied_without_local_capability(self):
         with self.assertRaisesRegex(ValueError, 'XKEEN_ALLOW_APPLY'):
             self.module.call_watchdog('select', selection={'node': 'B', 'expected_current': 'A'})

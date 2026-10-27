@@ -33,15 +33,13 @@ class TestSpeedService(unittest.TestCase):
         download.assert_called_once_with(cfg['benchmark_proxy'], cfg['download_bytes'],
                                          cfg['speed_connect_timeout_seconds'], cfg['speed_test_url'])
 
-    def test_download_has_hard_deadline_and_hides_worker_output(self):
-        with mock.patch.object(module.subprocess, 'run', side_effect=
-                               module.subprocess.TimeoutExpired('worker', 60)) as run:
-            with self.assertRaises(module.SpeedTestError) as raised:
-                module.download('http://127.0.0.1:17890', 1000000, 5)
-        self.assertEqual(raised.exception.code, 'download_timeout')
-        self.assertEqual(run.call_args.kwargs['timeout'], 60)
+    def test_download_has_no_total_duration_limit(self):
+        result = module.subprocess.CompletedProcess([], 0, '1000000', '')
+        with mock.patch.object(module.subprocess, 'run', return_value=result) as run:
+            self.assertEqual(module.download('http://127.0.0.1:17890', 1000000, 5), 1000000)
+        self.assertIsNone(run.call_args.kwargs.get('timeout'))
 
-    def test_real_download_worker_success_and_stalled_body_deadline(self):
+    def test_real_download_worker_success_and_stalled_body_socket_timeout(self):
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
@@ -67,9 +65,8 @@ class TestSpeedService(unittest.TestCase):
             url = f'http://127.0.0.1:{server.server_port}'
             self.assertEqual(module.download(url, 1000000, 5, url + '/ok'), 1000000)
             started = time.monotonic()
-            with mock.patch.object(module, 'DOWNLOAD_DEADLINE_SECONDS', 0.5):
-                with self.assertRaises(module.SpeedTestError) as raised:
-                    module.download(url, 1000000, 5, url + '/stall')
+            with self.assertRaises(module.SpeedTestError) as raised:
+                module.download(url, 1000000, 0.5, url + '/stall')
             self.assertEqual(raised.exception.code, 'download_timeout')
             self.assertLess(time.monotonic() - started, 1.5)
         finally:

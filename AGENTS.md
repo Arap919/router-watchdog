@@ -13,6 +13,10 @@ For router-watchdog runtime, Mihomo configuration, tests, packaging or cron work
 - Use `update_plan` for multi-step tasks when available; otherwise maintain the relevant documented checklist without pretending the tool exists.
 - If the user requests a team/swarm, use bounded worker/explorer tasks.
 
+## Test execution approval
+
+- Request approval to run the full test suite separately from all other actions. Never bundle the full-suite command with file edits, documentation updates, graph updates or other commands in the same approval request.
+
 ## Security and external actions
 
 - Never request secrets in chat. Use local ignored configuration or GitHub Actions secrets as appropriate.

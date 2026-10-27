@@ -136,8 +136,56 @@ class TestManualSpeed(unittest.TestCase):
             self.run_speed(apply=True)
 
 
+class TestSelectNode(TestManualSpeed):
+    def test_select_slower_without_download(self):
+        result = module.select_node(self.cfg, 'slow', 'dead')
+        self.assertEqual(result, {'group': 'main', 'applied': True, 'selected_after': 'slow'})
+        self.assertEqual(self.client.events, [('check', 'slow'), ('select', 'main', 'slow')])
+        self.measure.assert_not_called()
+
+    def test_select_current_is_noop(self):
+        result = module.select_node(self.cfg, 'dead', 'dead')
+        self.assertFalse(result['applied'])
+        self.assertEqual(result['selected_after'], 'dead')
+        self.assertFalse(any(e[0] == 'select' for e in self.client.events))
+
+    def test_changed_baseline_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, 'changed'):
+            module.select_node(self.cfg, 'slow', 'fast')
+        self.assertFalse(any(e[0] == 'select' for e in self.client.events))
+
+    def test_missing_or_offline_node_rejected(self):
+        for node in ('missing', 'slow'):
+            self.client.nodes['slow'] = 0
+            with self.subTest(node=node), self.assertRaises(RuntimeError):
+                module.select_node(self.cfg, node, 'dead')
+        self.assertEqual(self.client.selected['main'], 'dead')
+
+    def test_change_during_check_rejected(self):
+        original = self.client.provider_healthcheck
+        def check(*args):
+            self.client.selected['main'] = 'fast'
+            return original(*args)
+        with mock.patch.object(self.client, 'provider_healthcheck', side_effect=check):
+            with self.assertRaisesRegex(RuntimeError, 'changed'):
+                module.select_node(self.cfg, 'slow', 'dead')
+        self.assertEqual(self.client.selected['main'], 'fast')
+
+    def test_switch_verification_failure(self):
+        with mock.patch.object(self.client, 'select'):
+            with self.assertRaisesRegex(RuntimeError, 'verification'):
+                module.select_node(self.cfg, 'slow', 'dead')
+
+    def test_invalid_names_rejected_before_controller(self):
+        for node in ('', None, 2):
+            with self.subTest(node=node), mock.patch.object(module, 'Mihomo') as constructor:
+                with self.assertRaises(ValueError):
+                    module.select_node(self.cfg, node, 'dead')
+                constructor.assert_not_called()
+
+
 class TestManualCLI(unittest.TestCase):
-    def invoke(self, args, busy=False):
+    def invoke(self, args, busy=False, stdin=""):
         with tempfile.TemporaryDirectory() as folder:
             cfg = pathlib.Path(folder) / 'config.json'
             cfg.write_text(json.dumps({**DEFAULT_CONFIG, 'target_group': 'main'}))
@@ -147,6 +195,8 @@ class TestManualCLI(unittest.TestCase):
                   mock.patch.object(module, 'LOCK_PATH', pathlib.Path(folder) / 'lock'),
                   mock.patch.object(module, 'LOG_PATH', pathlib.Path(folder) / 'log'),
                   mock.patch.object(module, 'manual_speed', operation, create=True),
+                  mock.patch.object(module, 'select_node', operation, create=True),
+                  mock.patch('sys.stdin', io.StringIO(stdin)),
                   mock.patch.object(module.fcntl, 'flock', side_effect=BlockingIOError if busy else None),
                   mock.patch('sys.argv', ['router-watchdog', *args]),
                   mock.patch('sys.stdout', stdout), mock.patch('sys.stderr', stderr)):
@@ -164,3 +214,38 @@ class TestManualCLI(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(json.loads(output)['error'], 'busy')
         operation.assert_not_called()
+
+    def test_select_cli_stdin_and_lock(self):
+        code, output, operation = self.invoke(['--select-node'], stdin='{"node":"slow","expected_current":"dead"}')
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output), {'applied': False})
+        self.assertEqual(operation.call_args.args[1:], ('slow', 'dead'))
+        code, output, operation = self.invoke(['--select-node'], busy=True)
+        self.assertEqual(json.loads(output), {'error': 'busy'})
+        operation.assert_not_called()
+
+    def test_select_cli_invalid_stdin(self):
+        for value in ('[]', '{}', '{"node":"slow","expected_current":"dead","extra":1}', 'x' * 65537):
+            code, output, operation = self.invoke(['--select-node'], stdin=value)
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output)['error'], 'operation_failed')
+            operation.assert_not_called()
+
+    def test_mcp_profile_overrides_only_measurement_copy(self):
+        for action in ('--measure-selected', '--find-faster'):
+            code, output, operation = self.invoke([action, '--mcp-speed-profile'])
+            self.assertEqual(code, 0)
+            cfg = operation.call_args.args[0]
+            self.assertEqual((cfg['download_bytes'], cfg['parallel_streams'], cfg['multi_rounds']),
+                             (10000000, 4, 1))
+        code, output, operation = self.invoke(['--find-faster'])
+        cfg = operation.call_args.args[0]
+        self.assertEqual((cfg['download_bytes'], cfg['parallel_streams'], cfg['multi_rounds']),
+                         (25000000, 4, 2))
+
+    def test_mcp_profile_rejects_unrelated_actions_and_apply(self):
+        for args in (['--mcp-speed-profile'], ['--get-config', '--mcp-speed-profile'],
+                     ['--find-faster', '--apply', '--mcp-speed-profile']):
+            with self.subTest(args=args), self.assertRaises(SystemExit) as raised:
+                self.invoke(args)
+            self.assertEqual(raised.exception.code, 2)

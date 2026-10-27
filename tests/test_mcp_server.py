@@ -84,6 +84,13 @@ class TestMCPBridge(unittest.TestCase):
             self.module.call_watchdog('measure')
         self.assertNotIn('private', str(raised.exception))
 
+    def test_safe_router_error_is_reported_without_untrusted_message(self):
+        self.run.return_value = subprocess.CompletedProcess([], 1, json.dumps(
+            {'error': 'download_timeout', 'message': 'https://private/token'}), 'private-token')
+        with self.assertRaisesRegex(RuntimeError, 'download_timeout') as raised:
+            self.module.call_watchdog('find')
+        self.assertNotIn('private', str(raised.exception))
+
     def test_timeout_reports_remote_operation_may_continue(self):
         self.run.side_effect = subprocess.TimeoutExpired('ssh', 1800)
         with self.assertRaisesRegex(RuntimeError, 'continue'):

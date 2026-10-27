@@ -1,5 +1,8 @@
 import contextlib
 import io
+import http.server
+import threading
+import time
 import json
 import os
 import pathlib
@@ -30,6 +33,60 @@ class TestSpeedService(unittest.TestCase):
         download.assert_called_once_with(cfg['benchmark_proxy'], cfg['download_bytes'],
                                          cfg['speed_connect_timeout_seconds'], cfg['speed_test_url'])
 
+    def test_download_has_hard_deadline_and_hides_worker_output(self):
+        with mock.patch.object(module.subprocess, 'run', side_effect=
+                               module.subprocess.TimeoutExpired('worker', 60)) as run:
+            with self.assertRaises(module.SpeedTestError) as raised:
+                module.download('http://127.0.0.1:17890', 1000000, 5)
+        self.assertEqual(raised.exception.code, 'download_timeout')
+        self.assertEqual(run.call_args.kwargs['timeout'], 60)
+
+    def test_real_download_worker_success_and_stalled_body_deadline(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Length', '1000000')
+                self.end_headers()
+                try:
+                    if self.path.endswith('/stall'):
+                        self.wfile.write(b'x')
+                        self.wfile.flush()
+                        time.sleep(2)
+                    else:
+                        self.wfile.write(b'x' * 1000000)
+                except OSError:
+                    pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f'http://127.0.0.1:{server.server_port}'
+            self.assertEqual(module.download(url, 1000000, 5, url + '/ok'), 1000000)
+            started = time.monotonic()
+            with mock.patch.object(module, 'DOWNLOAD_DEADLINE_SECONDS', 0.5):
+                with self.assertRaises(module.SpeedTestError) as raised:
+                    module.download(url, 1000000, 5, url + '/stall')
+            self.assertEqual(raised.exception.code, 'download_timeout')
+            self.assertLess(time.monotonic() - started, 1.5)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_download_worker_failure_is_allowlisted(self):
+        for output, expected in [('download_http_error', 'download_http_error'),
+                                 ('https://private/token', 'download_failed')]:
+            result = module.subprocess.CompletedProcess([], 1, output, 'private-token')
+            with mock.patch.object(module.subprocess, 'run', return_value=result):
+                with self.assertRaises(module.SpeedTestError) as raised:
+                    module.download('http://127.0.0.1:17890', 1000000, 5)
+            self.assertEqual(raised.exception.code, expected)
+            self.assertNotIn('private', str(raised.exception))
+
     def test_default_is_configurable(self):
         self.assertIn('speed_test_url', module.validate_config(self.cfg))
         self.assertIn('speed_test_url', DEFAULT_CONFIG)
@@ -41,7 +98,7 @@ class TestSpeedService(unittest.TestCase):
         opener.open.return_value = response
         with (mock.patch.object(module.urllib.request, 'build_opener', return_value=opener),
               mock.patch.object(module.time, 'time_ns', return_value=123)):
-            received = module.download('http://127.0.0.1:17890', 1000000, 5,
+            received = module._download('http://127.0.0.1:17890', 1000000, 5,
                                        'https://test.example/down?token=a&size={bytes}&t={cache_bust}')
         self.assertEqual(received, 1000000)
         self.assertEqual(opener.open.call_args.args[0].full_url,

@@ -649,7 +649,7 @@ def download_url(template: str, size: int) -> str:
     return url
 
 
-def download(
+def _download(
     proxy: str, bytes_to_get: int, connect_timeout: int,
     url_template: str = DEFAULT_SPEED_TEST_URL,
 ) -> int:
@@ -670,7 +670,75 @@ def download(
                 break
             received += len(chunk)
     if received < bytes_to_get * 0.8:
-        raise RuntimeError(f"Speed test received only {received / 1_000_000:.1f} MB")
+        raise SpeedTestError("download_incomplete")
+    return received
+
+
+DOWNLOAD_DEADLINE_SECONDS = 60
+SPEED_ERROR_CODES = frozenset({
+    "download_timeout", "download_http_error", "download_network_error",
+    "download_incomplete", "download_failed",
+})
+
+
+class SpeedTestError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        self.code = code if code in SPEED_ERROR_CODES else "download_failed"
+        super().__init__(self.code)
+
+
+def download_error_code(exc: Exception) -> str:
+    if isinstance(exc, SpeedTestError):
+        return exc.code
+    if isinstance(exc, TimeoutError):
+        return "download_timeout"
+    if isinstance(exc, urllib.error.HTTPError):
+        return "download_http_error"
+    if isinstance(exc, urllib.error.URLError):
+        return ("download_timeout" if isinstance(exc.reason, TimeoutError)
+                else "download_network_error")
+    if isinstance(exc, OSError):
+        return "download_network_error"
+    return "download_failed"
+
+
+# A separate interpreter provides a hard deadline even while headers/body trickle.
+# Pass connection details over stdin; never include URLs in process arguments.
+_DOWNLOAD_WORKER = """
+import json, runpy, sys
+namespace = runpy.run_path(sys.argv[1])
+try:
+    received = namespace['_download'](*json.load(sys.stdin))
+except Exception as exc:
+    print(namespace['download_error_code'](exc))
+    sys.exit(1)
+print(received)
+"""
+
+
+def download(
+    proxy: str, bytes_to_get: int, connect_timeout: int,
+    url_template: str = DEFAULT_SPEED_TEST_URL,
+) -> int:
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _DOWNLOAD_WORKER, str(Path(__file__).resolve())],
+            input=json.dumps([proxy, bytes_to_get, connect_timeout, url_template]),
+            capture_output=True, text=True, timeout=DOWNLOAD_DEADLINE_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise SpeedTestError("download_timeout") from None
+    except OSError:
+        raise SpeedTestError("download_failed") from None
+    if result.returncode != 0:
+        raise SpeedTestError(result.stdout.strip()) from None
+    try:
+        received = int(result.stdout.strip())
+    except ValueError:
+        raise SpeedTestError("download_failed") from None
+    if not bytes_to_get * 0.8 <= received <= bytes_to_get:
+        raise SpeedTestError("download_incomplete")
     return received
 
 
@@ -1031,8 +1099,10 @@ def manual_speed(
         for item, delay in checked[:cfg["top_n"]]:
             try:
                 results.append(measure(item, delay))
-            except Exception:
-                # Never return controller/download exception text to MCP clients.
+            except Exception as exc:
+                # Log only a fixed code, never controller/download exception text.
+                code = download_error_code(exc)
+                log(f"Candidate speed test failed: {code}")
                 failed.append(item["name"])
     winner = choose_winner(results)
     faster = winner[2] > current[2]
@@ -1290,7 +1360,10 @@ def main() -> int:
     except Exception as exc:
         if machine:
             # Raw exceptions can include private URLs or tokens.
-            print(json.dumps({"error": "operation_failed",
+            code = exc.code if isinstance(exc, SpeedTestError) else "operation_failed"
+            with contextlib.redirect_stdout(sys.stderr):
+                log(f"Manual operation failed: {code}")
+            print(json.dumps({"error": code,
                               "message": "Operation failed; check settings and router state locally"}))
             return 1
         if args.sync_cron:
